@@ -1,0 +1,87 @@
+:root {
+  color-scheme: light;
+  --page: #f6f8f7;
+  --card: #fff;
+  --text: #172b23;
+  --muted: #64736c;
+  --border: #dce5df;
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --page: #141b17;
+  --card: #1d2721;
+  --text: #edf4ef;
+  --muted: #a1b1a7;
+  --border: #34483b;
+}
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+body {
+  margin: 0;
+  padding: 28px 16px;
+  background: var(--page);
+  color: var(--text);
+  font: 14px/1.6 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+.card {
+  width: 100%;
+  max-width: 440px;
+  margin: 0 auto;
+  padding: 24px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+}
+header { display: flex; align-items: center; gap: 12px; margin-bottom: 24px; }
+h1 { margin: 0; font-size: 20px; font-weight: 650; letter-spacing: -.4px; }
+.mark {
+  display: grid;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  border-radius: 11px;
+  background: #e7f6eb;
+  color: #15803d;
+  font-size: 19px;
+  font-weight: 700;
+}
+.picker { display: grid; gap: 6px; margin-bottom: 20px; }
+label, dt { color: var(--muted); }
+select {
+  width: 100%;
+  min-width: 0;
+  min-height: 42px;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--card);
+  color: var(--text);
+  font: inherit;
+}
+dl { margin: 0 0 24px; }
+dl > div { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px 16px; }
+dl > div + div { margin-top: 14px; }
+dd { margin: 0; font-weight: 550; }
+#connection-status[data-state="unchecked"] { color: var(--muted); }
+#connection-status[data-state="checking"] { color: #2563eb; }
+#connection-status[data-state="connected"] { color: #15803d; }
+#connection-status[data-state="failed"] { color: #b91c1c; }
+#failure-reason { margin: -8px 0 20px; color: #b91c1c; overflow-wrap: anywhere; }
+button {
+  width: 100%;
+  min-height: 44px;
+  border: 0;
+  border-radius: 9px;
+  background: #15803d;
+  color: #fff;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+button:hover:enabled { background: #166534; }
+button:disabled { cursor: wait; opacity: .55; }
+button:focus-visible, select:focus-visible { outline: 3px solid #60a5fa; outline-offset: 3px; }
+:root[data-theme="dark"] #connection-status[data-state="connected"] { color: #86efac; }
+:root[data-theme="dark"] #connection-status[data-state="checking"] { color: #93c5fd; }
+:root[data-theme="dark"] #connection-status[data-state="failed"],
+:root[data-theme="dark"] #failure-reason { color: #fca5a5; }

@@ -58,6 +58,26 @@ AstrBot 自身的全局白名单、唤醒词、模型启用开关和插件权限
 AstrBot 的机器人实例 ID 进一步隔离不同机器人。主动发送可使用事件的 `unified_msg_origin`。
 不要修改实例 ID 或 Native 地址来尝试恢复旧会话/回执，这会创建另一份状态。
 
+## 连接测试小卡片
+
+更新并重载插件后，进入 **插件管理 → WeChat Native 插件详情 → 可视化视图 → 连接测试**。
+先在原有机器人配置界面保存 Native 地址、Account ID 和 Token / token_file。
+卡片读取已保存的配置，未启用或启动失败的微信机器人也可检测；多个机器人时可用下拉框选择。
+
+页面打开后检测一次；点击 **测试连接** 或切换机器人可再次检测。检测中按钮和选择框暂时禁用，
+不自动轮询，也不订阅 SSE。成功显示绿色 **已连接 · 微信在线**；失败显示红色状态和简短原因。
+修改配置后先保存，再点击测试；新增机器人后可刷新视图更新列表。
+
+后端通过 `context.register_web_api()` 注册只读 GET 接口，按顺序读取 Native
+`/v1/status` 和 `/v1/accounts/{accountId}`。只确认服务就绪、认证有效、账号匹配且在线；
+**不发送微信消息、不修改游标或去重状态，也不验证模型、SSE 收信或发送权限**。
+检测使用独立的短连接客户端，不影响正在运行的机器人连接。
+每次检测重新读取已保存配置和 Token 文件；浏览器只得到机器人 ID、检测状态和安全的失败原因，
+不接收 Token、Token 路径、Native 原始响应或账号详情。
+
+常见失败原因：Token 无效/权限不足、API 地址或 Account ID 不存在、服务不可达/超时、
+账号尚未登录或离线。连接正常后仍需按文末清单由账号所有者完成真实收发验收。
+
 ## Docker 网络与 Token 挂载
 
 `127.0.0.1` 始终指向**发起请求的容器本身**。AstrBot 和 Native 不在同一网络命名空间时，
@@ -141,15 +161,18 @@ sqlite3 -readonly /path/to/state.sqlite3 \
 python3.12 -m venv .venv
 . .venv/bin/activate
 python -m pip install -r requirements-dev.txt
+python -m playwright install --with-deps chromium
 python -m pytest -q
 ruff check .
 ruff format --check .
-python -m compileall -q main.py adapter.py config.py event.py native_client.py state.py
+python -m compileall -q main.py adapter.py config.py event.py native_client.py state.py connection_view.py
 ```
 
 开发依赖锁定官方 AstrBot 4.29.3 源码提交；测试使用真实 AstrBot 类和 loopback aiohttp 模拟服务，
 覆盖认证与路径编码、SSE 分帧/游标恢复/重连、白名单、群 @门控、会话隔离、去重、撤回和发送回执。
-不需要真实微信账号或 Token，不会向真实微信发送消息。GitHub Actions 执行同样的检查。
+不需要真实微信账号或 Token，不会向真实微信发送消息。连接测试页面另用 Chromium 测试自动检测、重试和多机器人选择（仅替换 Dashboard bridge）。
+GitHub Actions 执行同样的检查。若系统已安装 `chromium`，测试优先使用系统浏览器；
+Playwright 仅属于开发依赖，安装插件时不需要浏览器或前端构建。
 Python 3.12 下 AstrBot 的音频依赖可能产生 `audioop` 弃用提示，与文本适配器无关。
 
 ## 真实环境验收清单（须由账号所有者执行或明确授权）

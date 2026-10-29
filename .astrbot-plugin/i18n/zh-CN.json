@@ -1,0 +1,8 @@
+{
+  "views": {
+    "connection": {
+      "title": "连接测试",
+      "description": "检查 Native 服务连接与微信账号在线状态。"
+    }
+  }
+}
