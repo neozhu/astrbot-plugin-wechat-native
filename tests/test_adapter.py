@@ -280,6 +280,38 @@ def test_plugin_registers_config_in_real_astrbot():
     assert metadata.default_config_tmpl["group_reply_mode"] == "mention"
 
 
+async def test_platform_icon_is_served_through_astrbot_file_api():
+    import xml.etree.ElementTree as ET
+
+    import httpx
+    from astrbot.core.platform.register import platform_registry
+    from astrbot.dashboard.api.files import router
+    from astrbot.dashboard.services.config_service import ConfigDisplayService
+    from astrbot.dashboard.services.file_service import FileService
+    from fastapi import FastAPI
+
+    module("main")
+    metadata = next(item for item in platform_registry if item.name == "wechat_native")
+    service = ConfigDisplayService.__new__(ConfigDisplayService)
+    service._logo_token_cache = {}
+    templates = {"wechat_native": metadata.default_config_tmpl.copy()}
+    await service.register_platform_logo(metadata, templates)
+    token = templates["wechat_native"].get("logo_token")
+    assert token, "WeChat Native must provide a resolvable platform icon"
+
+    app = FastAPI()
+    app.state.services = SimpleNamespace(files=FileService())
+    app.include_router(router, prefix="/api/v1")
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app), base_url="http://test"
+    ) as client:
+        for _ in range(2):  # The list and editor must both be able to fetch the icon.
+            response = await client.get(f"/api/v1/files/tokens/{token}")
+            assert response.status_code == 200
+            assert response.headers["content-type"].startswith("image/svg+xml")
+            assert ET.fromstring(response.content).tag == "{http://www.w3.org/2000/svg}svg"
+
+
 async def test_startup_retries_and_preserves_framework_instance_identity(serve, tmp_path):
     attempts = 0
     connected = asyncio.Event()

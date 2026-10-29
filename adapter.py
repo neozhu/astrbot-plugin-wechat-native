@@ -29,6 +29,7 @@ from .state import StateStore, cursor_number
     "直接连接 agent-wechat-native 的个人微信平台适配器",
     default_config_tmpl=DEFAULT_CONFIG.copy(),
     adapter_display_name="WeChat Native",
+    logo_path="logo.svg",
     support_streaming_message=False,
     config_metadata=CONFIG_METADATA,
 )
