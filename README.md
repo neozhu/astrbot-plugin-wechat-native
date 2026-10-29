@@ -15,6 +15,112 @@
 图片、语音、文件及原生引用回复尚未实现；不支持的输出组件会明确报错，不会假装发送成功。
 请关闭此机器人的文本转图片功能。流式模型输出会汇总为文本后发送。
 
+## AstrBot、Bridge 与 agent-wechat 的关系
+
+这里说的 **Bridge（桥接）由 WeChat Native 插件承担**：它作为平台适配层加载在 AstrBot 内部。
+部署时运行 **AstrBot + agent-wechat-native**，在 AstrBot 中安装本插件即可。
+
+```mermaid
+flowchart TB
+    USER["微信用户<br/>私聊 / 群聊 @"]
+    NATIVE["agent-wechat-native<br/>微信登录与消息收发<br/>提供 Native /v1 API"]
+
+    subgraph ASTRBOT["AstrBot 进程 / 容器"]
+        direction LR
+        PLUGIN["WeChat Native 插件<br/>Bridge / 平台适配层<br/>过滤、转换、会话隔离<br/>游标、去重、可靠发送"]
+        CORE["AstrBot 消息流水线<br/>会话、人格、插件与工具"]
+        PLUGIN -->|"AstrMessageEvent 入队"| CORE
+        CORE -->|"MessageChain 回复"| PLUGIN
+    end
+
+    MODEL["已配置的 AI 模型服务"]
+    USER <-->|"经微信服务收发消息"| NATIVE
+    NATIVE -->|"SSE 消息事件 / HTTP 响应"| PLUGIN
+    PLUGIN -->|"HTTP /v1 请求 + Bearer Token"| NATIVE
+    CORE <-->|"模型请求与生成结果"| MODEL
+
+    classDef native fill:#e8f3ff,stroke:#3b82f6,color:#172554
+    classDef plugin fill:#ecfdf3,stroke:#16a34a,color:#14532d
+    classDef core fill:#f3e8ff,stroke:#9333ea,color:#581c87
+    class NATIVE native
+    class PLUGIN plugin
+    class CORE core
+```
+
+| 部分 | 负责什么 | 在哪里配置 |
+| --- | --- | --- |
+| **AstrBot** | 消息处理、AI 模型调用、人格、上下文、插件和工具 | AstrBot 的模型与配置文件界面 |
+| **WeChat Native 插件（Bridge 角色）** | 把微信消息转换为 AstrBot 事件，把 AstrBot 回复转换为 Native 请求；管理白名单、会话、游标、去重和发送回执 | AstrBot 的 WeChat Native 机器人配置界面 |
+| **agent-wechat-native** | 维护微信登录与连接，执行实际微信收发，提供 `/v1` API 和 SSE 事件 | Native 服务端的登录与账号配置 |
+
+用户在机器人配置中填写的 **server_url、account_id 和 token / token_file 都指向 Native**。
+其中 `account_id` 是 Native 管理的账号 ID，Token 是 Native API 的访问凭据；
+AI 模型凭据由 AstrBot 的模型配置管理，本插件不需要 AstrBot OpenAPI Key。
+若使用 Docker 端口映射或反向代理，它们只负责让 AstrBot 能访问 Native 地址。
+
+## 一条微信消息如何得到回复
+
+下图中的插件和 AstrBot 流水线位于同一个进程；Native 是独立的微信服务。
+为便于阅读，`/events/stream`、`/messages/{messageId}` 和 `/sends` 均省略共同前缀
+`/v1/accounts/{accountId}`。
+
+```mermaid
+sequenceDiagram
+    participant U as 微信用户
+    participant N as agent-wechat-native
+    participant P as WeChat Native 插件
+    participant A as AstrBot 流水线
+    participant M as AI 模型服务
+
+    Note over P,A: 同一 AstrBot 进程<br/>插件承担 Bridge 角色
+    P->>N: GET /events/stream（SSE 长连接）
+    U->>N: 通过微信发送文本消息
+    N-->>P: message.committed 事件 + 游标
+    P->>N: GET /messages/{messageId}
+    N-->>P: 文本、发送者、聊天 ID 与 mentions
+    P->>P: 检查来源、时效和触发规则<br/>白名单 / 群 @ / 去重
+
+    alt 满足触发条件
+        P->>A: AstrMessageEvent 入队
+        Note over A: 人格、上下文、插件与工具
+        opt 需要 AI 模型
+            A->>M: 提交模型请求
+            M-->>A: 生成回复
+        end
+        opt AstrBot 产生文本回复
+            A-->>P: MessageChain 文本回复
+            P->>N: GET /messages/{messageId}<br/>发送前复查撤回
+            N-->>P: 最新消息状态
+            opt 原消息未撤回且允许发送
+                P->>P: 先保存本次输出的幂等键
+                P->>N: POST /sends<br/>文本、目标聊天、Idempotency-Key
+                N-->>P: sendId 与发送状态
+                loop queued / submitting 且未超时
+                    P->>N: GET /sends/{sendId}
+                    N-->>P: 最新发送状态
+                end
+                alt 最终状态为 accepted
+                    N-->>U: 微信回复发往原聊天
+                    Note over N,U: 不代表用户设备已确认收到
+                else 失败或结果不确定
+                    P->>P: 保留回执，人工检查<br/>失败或 needs_review 不自动重发
+                end
+            end
+        end
+    else 不满足触发条件
+        P->>P: 记录忽略并推进游标
+    end
+```
+
+**接收靠 SSE 通知，完整内容再通过 HTTP 读取；回复由 AstrBot 生成，通过 Native 发回原聊天。**
+群聊默认只接受 Native 明确标记的 `mentions.state == "known"` 且 `mentions.self == true`，
+并在回复时 @原发送者。插件同时隔离会话、保存事件游标并去重；
+发送结果不确定时保留原幂等键与回执供检查，避免自动重复回复。
+
+页面中的“测试连接”走另一条更短的只读路径：
+**连接测试卡片 → AstrBot 插件 Web API → Native `/v1/status` → Native 账号状态**。
+它确认服务可达、认证有效及微信在线，不会向模型提问或发送微信消息。
+
 ## 安装
 
 以下安装方式适用于已将这些文件发布到 GitHub 默认分支的仓库；本地开发完成不会自动推送代码。
