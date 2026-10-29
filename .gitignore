@@ -218,3 +218,17 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# WeChat Native: never commit secrets, account profiles or runtime journals
+api-token
+*token.local*
+server.local.*
+local-config*
+data/
+*.sqlite3
+*.sqlite3-*
+*.db
+*.db-*
+*.lock
+htmlcov/
+.superpowers/

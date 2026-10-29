@@ -1,0 +1,7 @@
+-r requirements.txt
+# Exact official source revision for the supported AstrBot release.
+astrbot @ git+https://github.com/AstrBotDevs/AstrBot.git@f61a7f42696da6df25dc7a249ec9b8d54ed9da18
+pytest>=8.4,<10
+pytest-asyncio>=1.1,<2
+pytest-cov>=6,<8
+ruff>=0.15,<0.18
