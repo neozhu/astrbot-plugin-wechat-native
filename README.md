@@ -15,6 +15,10 @@
 3. 在 **机器人 → 新增机器人** 中选择 **WeChat Native**，填写下表并启用。
 4. 为机器人选择 AstrBot 配置文件，配置模型和人格，再测试私聊及群 @回复。
 
+参数配置示例（Account ID 和开关以实际使用为准）：
+
+![WeChat Native 机器人参数配置](docs/wechat-nactive.png)
+
 ### 连接信息
 
 以下字段填写在 AstrBot 的机器人表单中，**不是 Native 的 server.toml 配置**。
