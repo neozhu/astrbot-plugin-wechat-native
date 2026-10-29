@@ -1,6 +1,7 @@
 import asyncio
 import json
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 import pytest
 from aiohttp import web
@@ -539,3 +540,264 @@ async def test_streaming_output_is_aggregated_once(serve, tmp_path):
         assert [payload for _, payload in sent] == [{"threadId": "peer", "text": "你好"}]
     finally:
         await adapter.terminate()
+
+
+@pytest.mark.parametrize(
+    "body,mentions,wanted",
+    [
+        ("@机器人\u2005/help", {"state": "known", "self": True}, "/help"),
+        ("@机器人\u2005 /help", {"state": "known", "self": True}, "/help"),
+        ("@成员\u2005@机器人\u2005/help", {"state": "known", "self": True}, "/help"),
+        ("hello @机器人\u2005/help", {"state": "known", "self": True}, "hello @机器人\u2005/help"),
+        ("@机器人 /help", {"state": "known", "self": True}, "@机器人 /help"),
+        ("@机器人\u2005/help", {"state": "unknown", "self": True}, "@机器人\u2005/help"),
+        ("@成员\u2005/help", {"state": "known", "self": False}, "@成员\u2005/help"),
+    ],
+)
+async def test_group_mention_prefix_normalization_keeps_raw_body(
+    serve, tmp_path, body, mentions, wanted
+):
+    from astrbot.api.message_components import Plain
+
+    msg = message(threadId="room@chatroom", body=body, mentions=mentions)
+    adapter, queue, _, _ = await make_adapter(serve, tmp_path, msg, group_reply_mode="all")
+    try:
+        await adapter.process_native_event(native_event(msg))
+        event = queue.get_nowait()
+        assert event.message_str == wanted
+        assert event.message_obj.raw_message["body"] == body
+        assert isinstance(event.message_obj.message[-1], Plain)
+        assert event.message_obj.message[-1].text == wanted
+        if wanted == "/help":
+            from astrbot.core.star.filter.command import CommandFilter
+
+            command = CommandFilter("/help")
+            command.handler_params = {}
+            event.is_at_or_wake_command = True
+            assert command.filter(event, {})
+    finally:
+        await adapter.terminate()
+
+
+@pytest.mark.parametrize("offset", [-600, 120])
+async def test_live_time_rejections_warn_without_content_and_are_rate_limited(
+    serve, tmp_path, monkeypatch, offset
+):
+    now = datetime.now(UTC).replace(microsecond=0)
+    msg = message(body="PRIVATE BODY", createdAt=(now + timedelta(seconds=offset)).isoformat())
+    adapter, queue, _, _ = await make_adapter(serve, tmp_path, msg)
+    clock = [0.0]
+    warnings = []
+    adapter_module = module("adapter")
+    monkeypatch.setattr(
+        adapter_module,
+        "time",
+        SimpleNamespace(time=lambda: now.timestamp(), monotonic=lambda: clock[0]),
+    )
+    monkeypatch.setattr(
+        adapter_module.logger, "warning", lambda text, *args: warnings.append(text % args)
+    )
+    try:
+        await adapter.process_native_event(native_event(msg))
+        msg["id"] = "m2"
+        await adapter.process_native_event(native_event(msg, "2"))
+        assert len(warnings) == 1
+        clock[0] = 61
+        msg["id"] = "m3"
+        await adapter.process_native_event(native_event(msg, "3"))
+        assert len(warnings) == 2
+        assert "PRIVATE BODY" not in " ".join(warnings)
+        assert str(abs(offset)) in warnings[0]
+        assert queue.empty()
+        assert adapter.state.cursor == "3"
+        assert adapter.state.message_status("m1") == "ignored"
+    finally:
+        await adapter.terminate()
+
+
+async def test_empty_output_is_no_reply_across_restart(serve, tmp_path):
+    from astrbot.api.event import MessageChain
+
+    adapter, queue, msg, sent = await make_adapter(serve, tmp_path)
+    try:
+        await adapter.process_native_event(native_event(msg))
+        await queue.get_nowait().send(MessageChain().message(" \n\t"))
+        assert adapter.state.message_status("m1") == "no_reply"
+        assert not sent
+    finally:
+        await adapter.terminate()
+    state = module("state").StateStore(next(tmp_path.glob("*.sqlite3")))
+    try:
+        assert state.message_status("m1") == "no_reply"
+    finally:
+        state.close()
+
+
+async def test_split_group_reply_only_auto_mentions_first_successful_segment(serve, tmp_path):
+    from astrbot.api.event import MessageChain
+    from astrbot.api.message_components import At, Plain
+
+    msg = message(threadId="room@chatroom", mentions={"state": "known", "self": True})
+    adapter, queue, _, sent = await make_adapter(serve, tmp_path, msg)
+    try:
+        await adapter.process_native_event(native_event(msg))
+        event = queue.get_nowait()
+        await event.send(MessageChain().message(" "))
+        await event.send(MessageChain().message("first"))
+        await event.send(MessageChain().message("second"))
+        await event.send(MessageChain([At(qq="other"), Plain("explicit")]))
+        assert [payload.get("mentions") for _, payload in sent] == [
+            {"userIds": ["user"]},
+            None,
+            {"userIds": ["other"]},
+        ]
+        msg["recall"] = {"observedAt": "now"}
+        await event.send(MessageChain().message("recalled segment"))
+        assert len(sent) == 3
+        assert event.is_stopped()
+    finally:
+        await adapter.terminate()
+
+
+async def test_later_validation_failure_keeps_partial_success_and_blocks_next_segment(
+    serve, tmp_path
+):
+    from astrbot.api.event import MessageChain
+    from astrbot.api.message_components import Image
+
+    adapter, queue, msg, sent = await make_adapter(serve, tmp_path)
+    try:
+        await adapter.process_native_event(native_event(msg))
+        event = queue.get_nowait()
+        await event.send(MessageChain().message("first"))
+        with pytest.raises(ValueError):
+            await event.send(MessageChain([Image.fromURL("https://invalid.example/image.png")]))
+        assert adapter.state.message_status("m1") == "partial"
+        assert adapter.state.send_record(sent[0][0])["state"] == "accepted"
+        with pytest.raises(RuntimeError, match="人工检查"):
+            await event.send(MessageChain().message("third"))
+        assert len(sent) == 1
+    finally:
+        await adapter.terminate()
+
+
+@pytest.mark.parametrize("failure_state", ["failed", "needs_review"])
+async def test_later_receipt_failure_keeps_partial_success(serve, tmp_path, failure_state):
+    from astrbot.api.event import MessageChain
+
+    msg = message()
+    posts = []
+
+    async def handler(req):
+        if req.method == "POST":
+            posts.append(await req.json())
+            return web.json_response(
+                {
+                    "id": "s" + str(len(posts)),
+                    "accountId": "a",
+                    "destination": "peer",
+                    "state": "accepted" if len(posts) == 1 else failure_state,
+                }
+            )
+        return web.json_response(msg)
+
+    url = await serve(handler)
+    adapter = module("adapter").WeChatNativeAdapter(
+        {"server_url": url, "account_id": "a", "token": "fake"},
+        {},
+        asyncio.Queue(),
+        state_dir=tmp_path,
+    )
+    await adapter.client.open()
+    try:
+        await adapter.process_native_event(native_event(msg))
+        event = adapter._event_queue.get_nowait()
+        await event.send(MessageChain().message("first"))
+        with pytest.raises(module("native_client").SendError):
+            await event.send(MessageChain().message("second"))
+        assert adapter.state.message_status("m1") == "partial"
+        assert [row[0] for row in adapter.state.db.execute("SELECT state FROM sends")] == [
+            "accepted",
+            failure_state,
+        ]
+        with pytest.raises(RuntimeError, match="人工检查"):
+            await event.send(MessageChain().message("third"))
+        assert len(posts) == 2
+    finally:
+        await adapter.terminate()
+
+
+async def test_unopened_proactive_send_does_not_create_outbox_entry(serve, tmp_path):
+    from astrbot.api.event import MessageChain
+    from astrbot.api.platform import MessageType
+    from astrbot.core.platform.message_session import MessageSession
+
+    adapter, _, _, sent = await make_adapter(serve, tmp_path)
+    await adapter.client.close()
+    session = MessageSession("native-a", MessageType.FRIEND_MESSAGE, "a|private|peer")
+    try:
+        with pytest.raises(ValueError, match="未连接"):
+            await adapter.send_by_session(session, MessageChain().message("proactive"))
+        assert adapter.state.db.execute("SELECT count(*) FROM sends").fetchone()[0] == 0
+        assert not sent
+    finally:
+        await adapter.terminate()
+
+
+@pytest.mark.parametrize("earlier_reply", [False, True])
+async def test_cancelled_waiting_segment_cannot_be_cleared_by_inflight_success(
+    serve, tmp_path, earlier_reply
+):
+    from astrbot.api.event import MessageChain
+
+    entered, release = asyncio.Event(), asyncio.Event()
+    msg, posts = message(), []
+
+    async def handler(req):
+        if req.method == "POST":
+            posts.append(await req.json())
+            send_id = "s" + str(len(posts))
+            if len(posts) == (2 if earlier_reply else 1):
+                entered.set()
+                await release.wait()
+            return web.json_response(
+                {"id": send_id, "state": "accepted", "accountId": "a", "destination": "peer"}
+            )
+        return web.json_response(msg)
+
+    url = await serve(handler)
+    adapter = module("adapter").WeChatNativeAdapter(
+        {"server_url": url, "account_id": "a", "token": "fake"},
+        {},
+        asyncio.Queue(),
+        state_dir=tmp_path,
+    )
+    await adapter.client.open()
+    inflight = waiting = None
+    try:
+        await adapter.process_native_event(native_event(msg))
+        event = adapter._event_queue.get_nowait()
+        if earlier_reply:
+            await event.send(MessageChain().message("earlier"))
+        inflight = asyncio.create_task(event.send(MessageChain().message("inflight")))
+        await asyncio.wait_for(entered.wait(), 2)
+        waiting = asyncio.create_task(event.send(MessageChain().message("waiting")))
+        await asyncio.sleep(0)
+        waiting.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiting
+        assert adapter.state.message_status("m1") == (
+            "partial" if earlier_reply else "needs_review"
+        )
+        release.set()
+        await inflight
+        assert adapter.state.message_status("m1") == "partial"
+        with pytest.raises(RuntimeError, match="人工检查"):
+            await event.send(MessageChain().message("must not continue"))
+        assert len(posts) == (2 if earlier_reply else 1)
+    finally:
+        release.set()
+        await adapter.terminate()
+        await asyncio.gather(
+            *(task for task in (inflight, waiting) if task), return_exceptions=True
+        )

@@ -43,10 +43,17 @@ class StateStore:
             CREATE TABLE IF NOT EXISTS sends (
                 key TEXT PRIMARY KEY, message_id TEXT, thread TEXT NOT NULL,
                 state TEXT NOT NULL, send_id TEXT);
+            CREATE INDEX IF NOT EXISTS sends_message_state ON sends(message_id, state);
         """)
         with self.db:
             self.db.execute("UPDATE messages SET status='needs_review' WHERE status='queued'")
             self.db.execute("UPDATE sends SET state='needs_review' WHERE state='submitting'")
+            self.db.execute(
+                "UPDATE messages SET status=CASE WHEN status='replied' THEN 'partial' "
+                "ELSE 'needs_review' END WHERE status IN ('replied','no_reply') "
+                "AND EXISTS (SELECT 1 FROM sends WHERE sends.message_id=messages.id "
+                "AND sends.state!='accepted')"
+            )
 
     def bind_server(self, server_id: str):
         if not isinstance(server_id, str) or not server_id:
@@ -96,8 +103,12 @@ class StateStore:
     def mark_message(self, message_id: str, status: str):
         with self.db:
             self.db.execute(
-                "UPDATE messages SET status=? WHERE id=? AND status!='recalled'",
-                (status, message_id),
+                "UPDATE messages SET status=CASE "
+                "WHEN status='partial' THEN 'partial' "
+                "WHEN status='replied' AND ? IN ('failed','needs_review') THEN 'partial' "
+                "WHEN status IN ('failed','needs_review') AND ?='replied' THEN 'partial' "
+                "ELSE ? END WHERE id=? AND status!='recalled'",
+                (status, status, status, message_id),
             )
 
     def recall(self, thread: str, server_id: str | None, message_id: str | None):
@@ -117,6 +128,10 @@ class StateStore:
 
     def begin_send(self, key: str, message_id: str | None, thread: str):
         with self.db:
+            self.db.execute(
+                "UPDATE messages SET status='queued' WHERE id=? AND status='no_reply'",
+                (message_id,),
+            )
             self.db.execute(
                 "INSERT INTO sends VALUES (?, ?, ?, 'submitting', NULL)", (key, message_id, thread)
             )

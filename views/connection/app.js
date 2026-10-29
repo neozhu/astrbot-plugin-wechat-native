@@ -11,11 +11,11 @@ function render(state, wechatOnline = null, failureReason = "") {
   status.dataset.state = state;
   status.textContent = {
     unchecked: "未检测", checking: "检测中",
-    connected: "已连接 · 微信在线", failed: "连接失败",
+    connected: "已连接", failed: "连接失败",
   }[state];
   online.textContent = wechatOnline === true ? "在线" : wechatOnline === false ? "离线" : "未检测";
-  reason.hidden = state !== "failed";
-  reason.textContent = state === "failed" ? failureReason : "";
+  reason.hidden = !failureReason;
+  reason.textContent = failureReason;
 }
 
 async function checkConnection() {
@@ -41,8 +41,8 @@ async function checkConnection() {
       return;
     }
     const result = await bridge.apiGet("connection/check", { bot_id: select.value });
-    if (result.state === "connected" && result.wechat_online === true) {
-      render("connected", true);
+    if (result.state === "connected") {
+      render("connected", result.wechat_online, result.reason || "");
     } else {
       render("failed", result.wechat_online, result.reason || "Native 连接检测失败");
     }

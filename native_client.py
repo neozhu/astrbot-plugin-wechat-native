@@ -6,6 +6,7 @@ from collections.abc import AsyncIterator
 from urllib.parse import quote
 
 import aiohttp
+from aiohttp.http_exceptions import LineTooLong
 
 from .state import cursor_number
 
@@ -135,6 +136,8 @@ class NativeClient:
             raise ValueError("文本必须非空且不超过 64 KiB（含 @名称）")
         if not key or any(ord(x) < 33 or ord(x) > 126 for x in key):
             raise ValueError("无效 Idempotency-Key")
+        if self.closed:
+            raise ValueError("Native 客户端未连接，未提交发送")
         payload = {"threadId": thread, "text": text}
         if mentions:
             payload["mentions"] = mentions
@@ -151,6 +154,7 @@ class NativeClient:
                 raise SendError("submission_unknown", key) from None
         deadline = asyncio.get_running_loop().time() + self.send_timeout
         send_id = None
+        poll_failed = False
         while True:
             if (
                 not isinstance(value.get("id"), str)
@@ -171,15 +175,24 @@ class NativeClient:
                 raise SendError(safe_state, key, send_id)
             remaining = deadline - asyncio.get_running_loop().time()
             if remaining <= 0:
-                raise SendError(state, key, send_id)
+                raise SendError("status_unavailable" if poll_failed else state, key, send_id)
             await asyncio.sleep(min(self.poll_interval, remaining))
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise SendError("status_unavailable" if poll_failed else state, key, send_id)
             try:
-                async with asyncio.timeout(
-                    max(0.001, deadline - asyncio.get_running_loop().time())
-                ):
+                async with asyncio.timeout(remaining):
                     value = await self.send(send_id)
-            except (NativeAPIError, TimeoutError):
+                poll_failed = False
+            except NativeAPIError as error:
+                if error.status in {0, 408, 429} or 500 <= error.status < 600:
+                    poll_failed = True
+                    continue  # Retry only the read, with the same send ID and deadline.
                 raise SendError("status_unavailable", key, send_id) from None
+            except TimeoutError:
+                raise SendError(
+                    "status_unavailable" if poll_failed else state, key, send_id
+                ) from None
 
     async def events(self, after: str) -> AsyncIterator[dict]:
         cursor_number(after)
@@ -195,6 +208,7 @@ class NativeClient:
                 headers={"Accept": "text/event-stream", "Last-Event-ID": after},
                 allow_redirects=False,
                 timeout=timeout,
+                read_bufsize=512 * 1024,  # StreamReader's line high-water limit is twice this.
             ) as response:
                 if response.status != 200:
                     raise NativeAPIError(
@@ -208,6 +222,8 @@ class NativeClient:
                         line = raw.decode("utf-8").rstrip("\r\n")
                     except UnicodeDecodeError:
                         raise NativeAPIError(502) from None
+                    if line.startswith(":"):
+                        continue  # Comments are not part of the pending event frame.
                     size += len(raw)
                     if size > 1024 * 1024:
                         raise NativeAPIError(502)
@@ -235,7 +251,7 @@ class NativeClient:
                                 raise NativeAPIError(502) from None
                             yield value
                         lines, event_type, event_id, size = [], "", "", 0
-                    elif not line.startswith(":"):
+                    else:
                         field, _, data = line.partition(":")
                         if data.startswith(" "):
                             data = data[1:]
@@ -246,5 +262,7 @@ class NativeClient:
                         elif field == "id":
                             event_id = data
                 # An incomplete frame must be replayed from the last committed cursor.
-        except (aiohttp.ClientError, TimeoutError, OSError, ValueError):
+        except (ValueError, LineTooLong):
+            raise NativeAPIError(502) from None
+        except (aiohttp.ClientError, TimeoutError, OSError):
             raise NativeAPIError(0, "timeout") from None

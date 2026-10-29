@@ -79,7 +79,7 @@ def test_four_states_single_automatic_check_and_manual_retry(page):
     expect(page.locator("#connection-status")).to_have_text("检测中")
     expect(page.get_by_role("button", name="测试连接")).to_be_disabled()
     complete(page, {"state": "connected", "wechat_online": True, "reason": ""})
-    expect(page.locator("#connection-status")).to_have_text("已连接 · 微信在线")
+    expect(page.locator("#connection-status")).to_have_text("已连接")
     expect(page.locator("#connection-status")).to_have_css("color", "rgb(21, 128, 61)")
     expect(page.locator("#wechat-status")).to_have_text("在线")
     expect(page.locator("#failure-reason")).to_be_hidden()
@@ -91,11 +91,13 @@ def test_four_states_single_automatic_check_and_manual_retry(page):
     ]
     page.get_by_role("button", name="测试连接").click()
     page.wait_for_function("window.pendingChecks.length === 2")
-    complete(page, {"state": "failed", "wechat_online": False, "reason": "微信账号当前不在线"}, 1)
+    complete(
+        page, {"state": "failed", "wechat_online": None, "reason": "Native Token 无效或已过期"}, 1
+    )
     expect(page.locator("#connection-status")).to_have_text("连接失败")
     expect(page.locator("#connection-status")).to_have_css("color", "rgb(185, 28, 28)")
-    expect(page.locator("#wechat-status")).to_have_text("离线")
-    expect(page.locator("#failure-reason")).to_have_text("微信账号当前不在线")
+    expect(page.locator("#wechat-status")).to_have_text("未检测")
+    expect(page.locator("#failure-reason")).to_have_text("Native Token 无效或已过期")
     expect(page.get_by_role("button", name="测试连接")).to_be_enabled()
     assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
 
@@ -110,7 +112,7 @@ def test_multiple_bots_selects_saved_id_and_tests_selected_bot(page):
     page.wait_for_function("window.pendingChecks.length === 2")
     assert page.evaluate("window.calls.at(-1)") == ["connection/check", {"bot_id": "native-2"}]
     complete(page, {"state": "connected", "wechat_online": True, "reason": ""}, 1)
-    expect(page.locator("#connection-status")).to_have_text("已连接 · 微信在线")
+    expect(page.locator("#connection-status")).to_have_text("已连接")
 
 
 def test_no_configured_robot_has_useful_empty_state(page):
@@ -131,4 +133,17 @@ def test_bridge_failure_does_not_render_raw_exception(page):
         "检测请求失败，请确认 AstrBot 登录有效后重试"
     )
     expect(page.locator("body")).not_to_contain_text("SENSITIVE RAW ERROR")
+    expect(page.get_by_role("button", name="测试连接")).to_be_enabled()
+
+
+@pytest.mark.parametrize("reason", ["微信账号尚未登录", "微信账号当前不在线"])
+def test_native_connected_and_wechat_offline_are_shown_separately(page, reason):
+    open_view(page, [{"id": "native-1"}])
+    start_check(page)
+    complete(page, {"state": "connected", "wechat_online": False, "reason": reason})
+    expect(page.locator("#connection-status")).to_have_text("已连接")
+    expect(page.locator("#connection-status")).to_have_css("color", "rgb(21, 128, 61)")
+    expect(page.locator("#wechat-status")).to_have_text("离线")
+    expect(page.locator("#failure-reason")).to_be_visible()
+    expect(page.locator("#failure-reason")).to_have_text(reason)
     expect(page.get_by_role("button", name="测试连接")).to_be_enabled()

@@ -1,6 +1,7 @@
 """AstrBot message conversion and event lifecycle."""
 
 import asyncio
+import re
 from datetime import UTC, datetime
 from urllib.parse import quote, unquote
 
@@ -59,13 +60,24 @@ def convert_message(raw: dict, config, self_id: str) -> AstrBotMessage:
     result.message_id = raw["id"]
     result.sender = MessageMember(user_id=sender, nickname=sender)
     result.group = Group(group_id=thread) if group else None
-    result.message_str = raw["body"]
+    text = raw["body"]
+    mentions = raw.get("mentions")
+    if (
+        group
+        and isinstance(mentions, dict)
+        and mentions.get("state") == "known"
+        and mentions.get("self") is True
+    ):
+        # WeChat terminates visible mention labels with U+2005. Keep the raw
+        # body intact, and never treat an ordinary typed @name as metadata.
+        text = re.sub(r"^(?:@[^\u2005\r\n]+\u2005[ \t]*)+", "", text)
+    result.message_str = text
     result.message = []
     # In all mode this is an explicit policy wake marker, not evidence of a real @.
     # The unmodified Native mentions remain available in raw_message.
     if group:
         result.message.append(At(qq=self_id))
-    result.message.append(Plain(raw["body"]))
+    result.message.append(Plain(text))
     result.raw_message = raw
     result.timestamp = message_timestamp(raw) or int(datetime.now(UTC).timestamp())
     return result
@@ -110,7 +122,7 @@ class WeChatNativeEvent(AstrMessageEvent):
         if status == "recalled":
             self.stop_event()
             return
-        if status in {"needs_review", "failed"}:
+        if status in {"needs_review", "failed", "partial"}:
             raise RuntimeError("此消息的回复需人工检查，禁止自动重发")
         try:
             sent = await self.adapter.send_chain(
@@ -123,7 +135,7 @@ class WeChatNativeEvent(AstrMessageEvent):
             # Includes validation/readback failures before an outbox entry exists.
             if not self.adapter._state_closed:
                 current = self.adapter.state.message_status(self.message_obj.message_id)
-                if current not in {"failed", "needs_review", "recalled"}:
+                if current not in {"failed", "needs_review", "partial", "recalled"}:
                     self.adapter.state.mark_message(
                         self.message_obj.message_id,
                         "failed" if isinstance(error, ValueError) else "needs_review",
@@ -131,6 +143,8 @@ class WeChatNativeEvent(AstrMessageEvent):
             raise
         if sent:
             await super().send(message)
+        elif self.adapter.state.message_status(self.message_obj.message_id) == "queued":
+            self.adapter.state.mark_message(self.message_obj.message_id, "no_reply")
 
     async def send_streaming(self, generator, use_fallback=False) -> None:
         # Native has no token streaming. Concatenate delta chains and send once.

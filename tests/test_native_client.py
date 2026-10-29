@@ -178,3 +178,105 @@ async def test_send_poll_deadline(serve):
         with pytest.raises(api.SendError) as error:
             await asyncio.wait_for(c.send_text("room@chatroom", "hi", "k"), 1)
     assert error.value.state == "submitting"
+
+
+async def test_unopened_client_rejects_send_before_submission(serve):
+    requests = []
+
+    async def handler(req):
+        requests.append(req.method)
+        return web.json_response(receipt())
+
+    c = client(await serve(handler))
+    with pytest.raises(ValueError, match="未连接"):
+        await c.send_text("room@chatroom", "hello", "stable-key")
+    assert requests == []
+
+
+async def test_sse_accepts_large_line_within_frame_limit(serve):
+    data = {"cursor": "1", "kind": "probe", "data": {"padding": "x" * (700 * 1024)}}
+
+    async def handler(req):
+        return web.Response(
+            text="data: " + json.dumps(data) + "\n\n", content_type="text/event-stream"
+        )
+
+    async with client(await serve(handler)) as c:
+        assert [event async for event in c.events("0")] == [data]
+
+
+async def test_sse_oversized_line_is_protocol_error(serve):
+    async def handler(req):
+        return web.Response(
+            body=b"data: " + b"x" * (1024 * 1024) + b"\n\n", content_type="text/event-stream"
+        )
+
+    api = module("native_client")
+    async with client(await serve(handler)) as c:
+        with pytest.raises(api.NativeAPIError) as error:
+            async for _ in c.events("0"):
+                pass
+    assert error.value.status == 502
+
+
+async def test_sse_comment_only_heartbeats_do_not_accumulate_frame_size(serve):
+    data = {"cursor": "1", "kind": "probe", "data": {}}
+
+    async def handler(req):
+        return web.Response(
+            text=": keepalive\n" * 96000 + "data: " + json.dumps(data) + "\n\n",
+            content_type="text/event-stream",
+        )
+
+    async with client(await serve(handler)) as c:
+        assert [event async for event in c.events("0")] == [data]
+
+
+async def test_receipt_poll_retries_transient_get_without_resubmitting(serve):
+    requests = []
+
+    async def handler(req):
+        requests.append(req.method)
+        if req.method == "POST":
+            return web.json_response(receipt("queued"), status=202)
+        if requests.count("GET") == 1:
+            return web.Response(status=503)
+        return web.json_response(receipt())
+
+    async with client(await serve(handler), poll_interval=0.001, send_timeout=1) as c:
+        assert (await c.send_text("room@chatroom", "hi", "stable-key"))["state"] == "accepted"
+    assert requests == ["POST", "GET", "GET"]
+
+
+async def test_receipt_poll_transient_failures_remain_bounded(serve):
+    requests = []
+
+    async def handler(req):
+        requests.append(req.method)
+        if req.method == "POST":
+            return web.json_response(receipt("queued"), status=202)
+        return web.Response(status=503)
+
+    api = module("native_client")
+    async with client(await serve(handler), poll_interval=0.001, send_timeout=0.05) as c:
+        with pytest.raises(api.SendError) as error:
+            await asyncio.wait_for(c.send_text("room@chatroom", "hi", "stable-key"), 1)
+    assert error.value.state == "status_unavailable"
+    assert error.value.send_id == "s1"
+    assert requests.count("POST") == 1
+    assert requests.count("GET") >= 2
+
+
+async def test_rate_limited_submission_with_missing_lookup_remains_unknown(serve):
+    requests = []
+
+    async def handler(req):
+        requests.append(req.method)
+        return web.Response(status=429 if req.method == "POST" else 404)
+
+    api = module("native_client")
+    async with client(await serve(handler)) as c:
+        with pytest.raises(api.SendError) as error:
+            await c.send_text("room@chatroom", "hi", "stable-key")
+    assert error.value.state == "submission_unknown"
+    assert requests == ["POST", "GET"]

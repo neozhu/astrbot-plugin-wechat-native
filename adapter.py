@@ -34,6 +34,7 @@ from .state import StateStore, cursor_number
 )
 class WeChatNativeAdapter(Platform):
     reconnect_delay = 1.0
+    time_warning_interval = 60.0
 
     def __init__(
         self,
@@ -61,6 +62,7 @@ class WeChatNativeAdapter(Platform):
         self._events = weakref.WeakValueDictionary()
         self._send_lock = asyncio.Lock()
         self._terminate_lock = asyncio.Lock()
+        self._last_time_warning = float("-inf")
 
     def meta(self) -> PlatformMetadata:
         return PlatformMetadata(
@@ -88,9 +90,18 @@ class WeChatNativeAdapter(Platform):
             or not raw["senderId"]
             or not isinstance(raw.get("body"), str)
             or not raw["body"].strip()
-            or stamp is None
-            or not -60 <= now - stamp <= 300
         ):
+            return False
+        if stamp is None or not -60 <= now - stamp <= 300:
+            monotonic = time.monotonic()
+            if monotonic - self._last_time_warning >= self.time_warning_interval:
+                self._last_time_warning = monotonic
+                delta = f"{now - stamp:.0f}" if stamp is not None else "未知"
+                logger.warning(
+                    "WeChat Native 实时消息因时间异常被忽略：时间差 %s 秒；"
+                    "允许范围 -60 至 300 秒，请检查时钟或消息积压",
+                    delta,
+                )
             return False
         thread = raw["threadId"]
         if not thread.endswith("@chatroom"):
@@ -215,21 +226,23 @@ class WeChatNativeAdapter(Platform):
     async def send_chain(self, thread: str, chain, *, source=None, event=None) -> bool:
         if self.stopped:
             raise RuntimeError("WeChat Native 已停止")
-        text, mentions = serialize_text(chain, group=thread.endswith("@chatroom"))
-        if not text.strip():
-            return False
-        if len(text.encode()) > 65536:
-            raise ValueError("Native 文本超过 64 KiB，未发送")
         task = asyncio.current_task()
         self._send_tasks.add(task)
         try:
             async with self._send_lock:
                 if self.stopped:
                     raise RuntimeError("WeChat Native 已停止")
+                text, mentions = serialize_text(chain, group=thread.endswith("@chatroom"))
+                if not text.strip():
+                    return False
+                if len(text.encode()) > 65536:
+                    raise ValueError("Native 文本超过 64 KiB，未发送")
+                if self.client.closed:
+                    raise ValueError("Native 客户端未连接，未提交发送")
                 message_id = source["id"] if source else None
                 if source:
                     source_status = self.state.message_status(message_id)
-                    if source_status in {"needs_review", "failed"}:
+                    if source_status in {"needs_review", "failed", "partial"}:
                         raise RuntimeError("此消息的回复需人工检查，禁止自动重发")
                     if source_status == "recalled":
                         if event:
@@ -243,6 +256,12 @@ class WeChatNativeAdapter(Platform):
                         or current.get("serverId") != source.get("serverId")
                     ):
                         raise ValueError("reply_source_identity_mismatch")
+                    if self.state.message_status(message_id) in {
+                        "needs_review",
+                        "failed",
+                        "partial",
+                    }:
+                        raise RuntimeError("此消息的回复需人工检查，禁止自动重发")
                     if (
                         current.get("recall") is not None
                         or self.state.message_status(message_id) == "recalled"
@@ -251,7 +270,11 @@ class WeChatNativeAdapter(Platform):
                         if event:
                             event.stop_event()
                         return False
-                    if thread.endswith("@chatroom") and mentions is None:
+                    if (
+                        thread.endswith("@chatroom")
+                        and mentions is None
+                        and source_status != "replied"
+                    ):
                         mentions = {"userIds": [source["senderId"]]}
                 key = "astrbot-" + uuid.uuid4().hex
                 self.state.begin_send(key, message_id, thread)

@@ -14,7 +14,11 @@ def _json(data):
 
 def _result(reason="", online=None):
     return _json(
-        {"state": "failed" if reason else "connected", "wechat_online": online, "reason": reason}
+        {
+            "state": "failed" if online is None else "connected",
+            "wechat_online": online,
+            "reason": reason,
+        }
     )
 
 

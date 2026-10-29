@@ -110,3 +110,43 @@ def test_recall_without_local_id_blocks_later_commit_across_restart(tmp_path):
     assert not state.accept("2", "late-local-id", "peer", "900", "queued")
     assert state.message_status("late-local-id") == "recalled"
     state.close()
+
+
+@pytest.mark.parametrize(
+    "initial,pending,recovered",
+    [("replied", "replied", "partial"), ("no_reply", "queued", "needs_review")],
+)
+def test_pending_later_submission_is_visible_after_restart(tmp_path, initial, pending, recovered):
+    State = module("state").StateStore
+    path = tmp_path / "state.sqlite3"
+    state = State(path)
+    state.accept("1", "m1", "peer", "900", "queued")
+    if initial == "replied":
+        state.begin_send("first-key", "m1", "peer")
+        state.finish_send("first-key", "accepted", "s1")
+    state.mark_message("m1", initial)
+    state.begin_send("pending-key", "m1", "peer")
+    try:
+        assert state.message_status("m1") == pending
+    finally:
+        state.close()  # Abrupt process loss: no adapter cancellation handler runs.
+    state = State(path)
+    try:
+        assert state.message_status("m1") == recovered
+        assert state.send_record("pending-key")["state"] == "needs_review"
+        if initial == "replied":
+            assert state.send_record("first-key")["state"] == "accepted"
+    finally:
+        state.close()
+
+
+@pytest.mark.parametrize("initial", ["failed", "needs_review", "partial"])
+def test_late_accepted_receipt_preserves_failure_gate(tmp_path, initial):
+    state = module("state").StateStore(tmp_path / "state.sqlite3")
+    try:
+        state.accept("1", "m1", "peer", "900", "queued")
+        state.mark_message("m1", initial)
+        state.mark_message("m1", "replied")
+        assert state.message_status("m1") == "partial"
+    finally:
+        state.close()

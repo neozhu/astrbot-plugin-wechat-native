@@ -133,7 +133,7 @@ async def test_short_failure_reasons(serve, status, account, want_online, reason
     url = await serve(handler)
     _, context = plugin([saved_robot(url)])
     assert await api(context, "check", "bot_id=native-1") == {
-        "state": "failed",
+        "state": "connected" if want_online is False else "failed",
         "wechat_online": want_online,
         "reason": reason,
     }
