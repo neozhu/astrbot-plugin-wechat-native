@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.14 — 2026-11-13
+
+- Preserve connection status and offline reasons during automatic refresh and post-login checks to prevent panel flicker and layout jumps.
+- Combine offline reasons, QR login guidance and retry controls in one card that hides when the account comes online.
+- Register alert commands with Chinese primary names (`绑定通知`, `解绑通知`, `通知状态`, `测试通知`), retaining the existing English names as aliases.
+
 ## 0.3.13 — 2026-11-12
 
 - Make explicit QR retries bypass saved-session recovery; persist the request strategy with its idempotency key across timeouts and restarts.
