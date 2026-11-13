@@ -187,14 +187,14 @@
 
 ### 6.1 交互（中文优先）
 
-| 中文指令 | 英文主命令 / 别名 | 含义 |
+| 中文主命令 | 英文别名 | 含义 |
 |---|---|---|
 | `/绑定通知 [native_bot_id]` | `/bind_alert [native_bot_id]` | 将**当前私聊会话**设置为该 Native 机器人的通知接收目标 |
 | `/解绑通知 [native_bot_id]` | `/unbind_alert [native_bot_id]` | 移除此 Native 机器人的通知目标 |
 | `/通知状态 [native_bot_id]` | `/alert_status [native_bot_id]` | 查看健康状态、绑定平台与最近一次通知尝试结果 |
 | `/测试通知 [native_bot_id]` | `/test_alert [native_bot_id]` | 显式发送一次测试消息，不改变事故状态 |
 
-**命令注册要求：** 使用 `@filter.command("bind_alert", alias={"绑定通知"})` 等等；英文为注册主命令、中文为 `alias`，同一 Handler 实现。Telegram Bot 命令菜单只接受 ASCII 小写、数字、下划线，中文 Alias 不必出现在菜单中，但支持文本消息直接输入。禁止写两套中英业务函数。
+**命令注册要求：** 使用 `@filter.command("绑定通知", alias={"bind_alert"})` 等等；中文为注册主命令、英文为 `alias`，与“总结群聊”“读取图片”一致，在 AstrBot 指令管理中显示中文名，同一 Handler 实现。禁止写两套中英业务函数。
 
 **省略 ID 规则：** 当前只有一个已启用 Native 机器人时，`/绑定通知` 即绑定它；如果多个，必须明确写 ID，例如 `/绑定通知 native_bot_01`，否则返回候选 ID 列表。无匹配机器人返回清晰错误，不猜测。
 
@@ -483,8 +483,8 @@ Requirements:
 2. Run a read-only background health monitor every 60s with thresholds
    3 consecutive failures / 2 consecutive successes.
 3. Implement four platform-agnostic admin-only private-chat commands:
-   /bind_alert (alias /绑定通知), /unbind_alert (alias /解绑通知),
-   /alert_status (alias /通知状态), /test_alert (alias /测试通知).
+   /绑定通知 (alias /bind_alert), /解绑通知 (alias /unbind_alert),
+   /通知状态 (alias /alert_status), /测试通知 (alias /test_alert).
    Omit the native bot ID only when exactly one enabled bot exists.
 4. Capture the trusted incoming platform instance ID and unified_msg_origin;
    persist exactly one alert binding per native bot in AstrBot Plugin KV.

@@ -110,14 +110,14 @@ async function pollLogin() {
   const entry = loginEntries.get(botId);
   if (document.hidden || !entry?.started || !entry.allowed || entry.busy || entry.completed) return;
   if (entry.verify) {
-    await checkConnection();
+    await checkConnection({background: true});
     return;
   }
   if (entry.terminal) return;
   entry.busy = true;
   try {
     await renderLogin(entry, await bridge.apiGet("connection/login/status", {bot_id: botId}), botId, revision);
-    if (entry.verify && currentView(botId, revision)) await checkConnection();
+    if (entry.verify && currentView(botId, revision)) await checkConnection({background: true});
   } catch {
     loginFailure(entry, botId, revision);
   } finally {
@@ -300,11 +300,11 @@ async function loadConnection(botId, revision) {
   }
 }
 
-async function checkConnection() {
+async function checkConnection({background = false} = {}) {
   if (checking) return;
   checking = true;
   button.disabled = select.disabled = true;
-  render("checking");
+  if (!background) render("checking");
   try {
     if (!botsLoaded) {
       const result = await bridge.apiGet("connection/bots");
@@ -361,7 +361,7 @@ document.addEventListener("visibilitychange", () => {
 new ResizeObserver(renderChart).observe(chart);
 try {
   await bridge.ready();
-  setInterval(() => { if (!document.hidden) checkConnection(); }, 30000);
+  setInterval(() => { if (!document.hidden) checkConnection({background: true}); }, 30000);
   setInterval(pollLogin, 2000);
   await checkConnection();
 } catch {

@@ -172,28 +172,28 @@ class WeChatNativePlugin(Star):
     async def terminate(self):
         await self.connection_monitor.stop()
 
-    @filter.command("bind_alert", alias={"绑定通知"})
+    @filter.command("绑定通知", alias={"bind_alert"})
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def bind_alert(self, event: AstrMessageEvent, bot_id: str = ""):
         """在管理员私聊中绑定 Native 连接通知。"""
         yield event.plain_result(await self.alert_bindings.execute("bind", event, bot_id))
         event.stop_event()
 
-    @filter.command("unbind_alert", alias={"解绑通知"})
+    @filter.command("解绑通知", alias={"unbind_alert"})
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def unbind_alert(self, event: AstrMessageEvent, bot_id: str = ""):
         """移除指定 Native 机器人的通知绑定。"""
         yield event.plain_result(await self.alert_bindings.execute("unbind", event, bot_id))
         event.stop_event()
 
-    @filter.command("alert_status", alias={"通知状态"})
+    @filter.command("通知状态", alias={"alert_status"})
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def alert_status(self, event: AstrMessageEvent, bot_id: str = ""):
         """查看 Native 连接健康与通知尝试状态。"""
         yield event.plain_result(await self.alert_bindings.execute("status", event, bot_id))
         event.stop_event()
 
-    @filter.command("test_alert", alias={"测试通知"})
+    @filter.command("测试通知", alias={"test_alert"})
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def test_alert(self, event: AstrMessageEvent, bot_id: str = ""):
         """向已绑定私聊显式尝试发送一次测试通知。"""

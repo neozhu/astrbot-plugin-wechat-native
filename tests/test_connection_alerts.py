@@ -276,7 +276,7 @@ async def test_parallel_monitor_checks_serialize_and_stop_cancels_all_tasks():
     assert monitor.task is None
 
 
-async def test_aliases_share_handlers_and_ascii_primary_commands(monkeypatch):
+async def test_aliases_share_handlers_and_chinese_primary_commands(monkeypatch):
     from astrbot.core.star import command_management
 
     module("main")
@@ -291,10 +291,10 @@ async def test_aliases_share_handlers_and_ascii_primary_commands(monkeypatch):
         if c["module_path"] == "wechat_plugin.main"
     }
     for command, alias in (
-        ("bind_alert", "绑定通知"),
-        ("unbind_alert", "解绑通知"),
-        ("alert_status", "通知状态"),
-        ("test_alert", "测试通知"),
+        ("绑定通知", "bind_alert"),
+        ("解绑通知", "unbind_alert"),
+        ("通知状态", "alert_status"),
+        ("测试通知", "test_alert"),
     ):
         assert command in commands
         assert alias in commands[command]["aliases"]

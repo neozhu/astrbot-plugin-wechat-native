@@ -453,3 +453,71 @@ def test_automatic_refresh_is_non_overlapping_and_pauses_when_hidden(page):
     page.evaluate("Object.defineProperty(document, 'hidden', {get: () => true})")
     page.clock.fast_forward(60000)
     assert page.evaluate("window.pendingChecks.length") == 2
+
+
+@pytest.mark.parametrize("result", [
+    offline_result(),
+    {"state": "failed", "wechat_online": None, "reason": "Native 服务不可达"},
+])
+def test_automatic_refresh_preserves_offline_status_and_layout(page, result):
+    page.clock.install()
+    open_view(page, [{"id": "native-1"}])
+    start_check(page)
+    complete(page, result)
+    expect(page.get_by_role("button", name="刷新", exact=True)).to_be_enabled()
+    expect(page.locator("#failure-reason")).to_have_text(result["reason"])
+    if result.get("health") == "offline":
+        expect(page.locator("#login-qr")).to_be_visible()
+    connection_status = page.locator("#connection-status").inner_text()
+    wechat_status = page.locator("#wechat-status").inner_text()
+    metrics_top = page.locator(".metrics").bounding_box()["y"]
+
+    for index in (1, 2):
+        page.clock.fast_forward(30000)
+        page.wait_for_function(f"window.pendingChecks.length === {index + 1}")
+        expect(page.locator("#connection-status")).to_have_text(connection_status)
+        expect(page.locator("#wechat-status")).to_have_text(wechat_status)
+        expect(page.locator("#failure-reason")).to_be_visible()
+        expect(page.locator("#failure-reason")).to_have_text(result["reason"])
+        assert page.locator(".metrics").bounding_box()["y"] == metrics_top
+        complete(page, result, index)
+        expect(page.get_by_role("button", name="刷新", exact=True)).to_be_enabled()
+        assert page.locator(".metrics").bounding_box()["y"] == metrics_top
+
+    page.get_by_role("button", name="刷新", exact=True).click()
+    page.wait_for_function("window.pendingChecks.length === 4")
+    expect(page.locator("#connection-status")).to_have_text("检测中")
+    complete(page, {"state": "connected", "wechat_online": True, "health": "online"}, 3)
+    expect(page.locator("#connection-status")).to_have_text("已连接")
+    expect(page.locator("#wechat-status")).to_have_text("在线")
+    expect(page.locator("#failure-reason")).to_be_hidden()
+    expect(page.locator("#login-panel")).to_be_hidden()
+
+
+def test_post_login_checks_preserve_offline_status_until_online(page):
+    page.clock.install()
+    open_view(page, [{"id": "native-1"}])
+    page.evaluate("window.loginStartResult = {state:'succeeded', qr_available:false}")
+    start_check(page)
+    complete(page, offline_result())
+    expect(page.locator("#login-status")).to_contain_text("登录任务已完成")
+    expect(page.get_by_role("button", name="刷新", exact=True)).to_be_enabled()
+    metrics_top = page.locator(".metrics").bounding_box()["y"]
+
+    for index in (1, 2):
+        page.clock.fast_forward(2000)
+        page.wait_for_function(f"window.pendingChecks.length === {index + 1}")
+        expect(page.locator("#connection-status")).to_have_text("已连接")
+        expect(page.locator("#wechat-status")).to_have_text("离线")
+        expect(page.locator("#failure-reason")).to_have_text("微信账号尚未登录")
+        expect(page.locator("#failure-reason")).to_be_visible()
+        assert page.locator(".metrics").bounding_box()["y"] == metrics_top
+        complete(page, offline_result(), index)
+        expect(page.get_by_role("button", name="刷新", exact=True)).to_be_enabled()
+
+    page.clock.fast_forward(2000)
+    page.wait_for_function("window.pendingChecks.length === 4")
+    complete(page, {"state": "connected", "wechat_online": True, "health": "online"}, 3)
+    expect(page.locator("#wechat-status")).to_have_text("在线")
+    expect(page.locator("#failure-reason")).to_be_hidden()
+    expect(page.locator("#login-panel")).to_be_hidden()
