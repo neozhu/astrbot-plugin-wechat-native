@@ -42,6 +42,9 @@ class Native:
     def __init__(self, raw):
         self.raw = raw
         self.calls = []
+        self.messages_by_id = {raw["id"]: raw}
+        self.assets_by_message = {}
+        self.thread_messages = []
         self.asset = {
             "id": "sticker-original",
             "accountId": "a",
@@ -149,12 +152,18 @@ class Native:
         if "/jobs/" in path or path.endswith("by-idempotency-key"):
             return web.json_response(self.job(getattr(self, "last_kind", "sticker_saved")))
         if path.endswith("/media"):
-            return web.json_response({"items": [self.asset]})
+            msg_id = path.rsplit("/", 2)[-2]
+            return web.json_response({"items": [self.assets_by_message.get(msg_id, self.asset)]})
         if path.endswith("/content"):
             self.content_requests.append(dict(req.query))
             return web.Response(body=GIF, content_type="image/gif")
+        if path.endswith("/messages"):
+            return web.json_response({"items": self.thread_messages})
         if "/messages/" in path:
-            return web.json_response(self.raw)
+            msg_id = path.rsplit("/", 1)[1]
+            if msg_id == self.raw["id"]:
+                return web.json_response(self.raw)
+            return web.json_response(self.messages_by_id.get(msg_id, self.raw))
         if path.endswith("/custom-stickers"):
             return web.json_response(
                 {"items": self.saved, "revision": "rev", "freshness": "profile"}
@@ -1457,5 +1466,81 @@ async def test_post_sticker_send_followup_and_tts_suppression(serve, tmp_path, o
             assert len(event.get_result().chain) == 1
             await event.send(MessageChain([Plain("发送失败说明")]))
             assert len([c for c in native.calls if c[0] == "POST" and "text" in c[2]]) == 1
+    finally:
+        await adapter.terminate()
+
+
+def missing_quote(**changes):
+    raw = quoted(state="missing", **changes)
+    raw["quote"].pop("embeddedSticker", None)
+    return raw
+
+
+async def test_missing_sticker_quote_resolves_original_message_and_saves(serve, tmp_path):
+    from astrbot.api.message_components import Image, Reply
+
+    orig = message(id="m_orig", type=47, serverId="800", senderId="other", body=None)
+    raw = missing_quote()
+    native, adapter = await setup(serve, tmp_path, raw)
+    native.messages_by_id["m_orig"] = orig
+    native.thread_messages = [raw, orig]
+    native.assets_by_message["m_orig"] = {**native.asset, "id": "orig-asset", "messageId": "m_orig"}
+    try:
+        event = await deliver(adapter, raw)
+        assert any(isinstance(c, Image) for c in event.message_obj.message)
+        assert any(
+            isinstance(c, Reply) and "表情" in c.message_str for c in event.message_obj.message
+        )
+        assert any(p.endswith("/messages/m_orig/media") for _, p, _, _ in native.calls)
+
+        data = await save(event, "猫猫")
+        assert data["ok"] and data["status"] == "success"
+        post = [c for c in native.calls if c[0] == "POST" and c[1].endswith("/custom-stickers")][0]
+        assert post[2] == {
+            "source": {"kind": "message", "messageId": "m_orig", "assetId": "orig-asset"}
+        }
+    finally:
+        await adapter.terminate()
+
+
+async def test_missing_sticker_quote_blocks_recalled_original(serve, tmp_path):
+    orig = message(id="m_orig", type=47, serverId="800", senderId="other", body=None)
+    raw = missing_quote()
+    native, adapter = await setup(serve, tmp_path, raw)
+    native.messages_by_id["m_orig"] = orig
+    native.assets_by_message["m_orig"] = {**native.asset, "id": "orig-asset", "messageId": "m_orig"}
+    try:
+        await adapter.process_native_event(native_event(orig, "1"))
+        orig["recall"] = {"at": "now"}
+        await adapter.process_native_event(
+            {
+                "kind": "message.recalled",
+                "cursor": "2",
+                "data": {"threadId": orig["threadId"], "serverId": "800", "messageId": "m_orig"},
+            }
+        )
+        await adapter.process_native_event(native_event(raw, "3"))
+        if adapter._media_tasks:
+            await asyncio.gather(*list(adapter._media_tasks))
+        assert adapter._event_queue.empty()
+        assert not any(p.endswith("/media") for _, p, _, _ in native.calls)
+    finally:
+        await adapter.terminate()
+
+
+async def test_missing_sticker_quote_rejects_mismatched_original_sender(serve, tmp_path):
+    orig = message(id="m_orig", type=47, serverId="800", senderId="wrong_sender", body=None)
+    raw = missing_quote()
+    native, adapter = await setup(serve, tmp_path, raw)
+    native.messages_by_id["m_orig"] = orig
+    native.thread_messages = [raw, orig]
+    native.assets_by_message["m_orig"] = {**native.asset, "id": "orig-asset", "messageId": "m_orig"}
+    try:
+        await adapter.process_native_event(native_event(raw, "1"))
+        if adapter._media_tasks:
+            await asyncio.gather(*list(adapter._media_tasks))
+        assert adapter._event_queue.empty()
+        assert len([c for c in native.calls if c[0] == "POST" and "text" in c[2]]) == 1
+        assert not any(p.endswith("/custom-stickers") for _, p, _, _ in native.calls)
     finally:
         await adapter.terminate()

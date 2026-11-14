@@ -60,7 +60,7 @@ from .native_client import (
     load_outgoing_voice,
 )
 from .state import StateStore, cursor_number, state_path
-from .sticker_service import StickerService, quoted_sticker
+from .sticker_service import StickerService, quoted_sticker_candidate
 from .summary import GroupSummaryCache, is_summary_command
 from .wechat_actions import WeChatActions
 
@@ -245,7 +245,7 @@ class WeChatNativeAdapter(Platform):
         quote = raw.get("quote")
         is_quoted_image = is_quote and isinstance(quote, dict) and quote.get("type") == 3
         is_quoted_voice = is_quote and isinstance(quote, dict) and quote.get("type") == 34
-        is_quoted_sticker = cfg.enable_stickers and quoted_sticker(raw)
+        is_quoted_sticker = cfg.enable_stickers and quoted_sticker_candidate(raw)
         # Native reports the quoted file's title as embeddedText (state is "unsupported").
         is_quoted_pdf = (
             is_quote
@@ -761,7 +761,9 @@ class WeChatNativeAdapter(Platform):
                 return
             if error.reason == "recalled":
                 if not self._state_closed and self.state.message_status(message_id) == "queued":
-                    if wrapped.get_extra("wechat_native_quote_invalidated"):
+                    if wrapped.get_extra("wechat_native_quote_invalidated") or (
+                        is_sticker and raw.get("recall") is None
+                    ):
                         self.state.mark_message(message_id, "no_reply")
                     else:
                         self.state.recall(thread, raw.get("serverId"), message_id)
@@ -1053,7 +1055,7 @@ class WeChatNativeAdapter(Platform):
                 recent_kind
                 or (
                     "sticker"
-                    if self.native_config.enable_stickers and quoted_sticker(raw)
+                    if self.native_config.enable_stickers and quoted_sticker_candidate(raw)
                     else "voice"
                     if raw.get("type") == 34
                     or (isinstance(quote, dict) and quote.get("type") == 34)

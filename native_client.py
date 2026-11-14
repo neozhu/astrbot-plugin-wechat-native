@@ -136,6 +136,15 @@ VOICE_ERROR_MESSAGES = {
     "recent_unavailable": "未找到你在本群最近2分钟发送的语音，请重新发送或引用语音。",
 }
 
+STICKER_ERROR_MESSAGES = {
+    "unavailable": "引用的表情无法读取，请重新发送。",
+    "expired": "引用的表情已失效，请重新发送。",
+    "too_large": "表情太大，暂时无法处理。",
+    "missing_scope": "表情读取功能未正确配置，请联系管理员。",
+    "unsupported_format": "暂不支持这种表情格式。",
+    "recalled": "",
+}
+
 _VARIANT_RANK = {"original": 0, "standard": 1, "thumbnail": 2}
 _NON_TRANSFERABLE_STATES = {
     "available",
@@ -156,10 +165,12 @@ class NativeAPIError(Exception):
 
 class MediaError(Exception):
     def __init__(self, reason: str = "unavailable", *, media_kind: str = "image"):
-        self.media_kind = media_kind if media_kind in {"pdf", "voice"} else "image"
-        messages = {"pdf": PDF_ERROR_MESSAGES, "voice": VOICE_ERROR_MESSAGES}.get(
-            self.media_kind, MEDIA_ERROR_MESSAGES
-        )
+        self.media_kind = media_kind if media_kind in {"pdf", "voice", "sticker"} else "image"
+        messages = {
+            "pdf": PDF_ERROR_MESSAGES,
+            "voice": VOICE_ERROR_MESSAGES,
+            "sticker": STICKER_ERROR_MESSAGES,
+        }.get(self.media_kind, MEDIA_ERROR_MESSAGES)
         self.reason = reason if reason in messages else "unavailable"
         self.user_message = messages[self.reason]
         super().__init__(f"Native media error: {self.reason}")
@@ -798,14 +809,28 @@ class NativeClient:
     def _login_operation(self, value, operation_id=None):
         result = value.get("result")
         if (
-            not isinstance(value.get("id"), str) or not value["id"]
+            not isinstance(value.get("id"), str)
+            or not value["id"]
             or (operation_id is not None and value["id"] != operation_id)
-            or value.get("accountId") != self.account_id or value.get("kind") != "login"
+            or value.get("accountId") != self.account_id
+            or value.get("kind") != "login"
             or not isinstance(value.get("state"), str)
-            or value.get("state") not in {
-                "starting", "resuming", "authenticating",
-                "queued", "running", "awaiting_scan", "awaiting_approval", "succeeded",
-                "expired", "failed", "rejected", "cancelled", "needs_login", "needs_review",
+            or value.get("state")
+            not in {
+                "starting",
+                "resuming",
+                "authenticating",
+                "queued",
+                "running",
+                "awaiting_scan",
+                "awaiting_approval",
+                "succeeded",
+                "expired",
+                "failed",
+                "rejected",
+                "cancelled",
+                "needs_login",
+                "needs_review",
             }
             or not isinstance(value.get("createdAt"), str)
             or not isinstance(value.get("updatedAt"), str)
@@ -822,10 +847,15 @@ class NativeClient:
 
     async def start_login(self, key, *, force_qr=False):
         value = await self._request(
-            "POST", self.prefix + "/login-attempts", expected_status=202,
-            headers={"Idempotency-Key": key}, json={
+            "POST",
+            self.prefix + "/login-attempts",
+            expected_status=202,
+            headers={"Idempotency-Key": key},
+            json={
                 "strategy": "qr" if force_qr else "auto",
-                "allowQr": True, "forceQr": force_qr, "timeoutSeconds": 900,
+                "allowQr": True,
+                "forceQr": force_qr,
+                "timeoutSeconds": 900,
                 "qrRefresh": {"mode": "auto", "maxRefreshes": 3},
             },
         )
@@ -833,7 +863,8 @@ class NativeClient:
 
     async def login_status(self, operation_id):
         value = await self._request(
-            "GET", self.prefix + "/login-attempts/" + quote(operation_id, safe=""),
+            "GET",
+            self.prefix + "/login-attempts/" + quote(operation_id, safe=""),
             expected_status=200,
         )
         return self._login_operation(value, operation_id)
@@ -843,9 +874,13 @@ class NativeClient:
             raise NativeAPIError(502)
         try:
             async with self._session.get(
-                self.api_url + self.prefix + "/login-attempts/"
-                + quote(operation_id, safe="") + "/qr",
-                params={"generation": str(generation)}, allow_redirects=False,
+                self.api_url
+                + self.prefix
+                + "/login-attempts/"
+                + quote(operation_id, safe="")
+                + "/qr",
+                params={"generation": str(generation)},
+                allow_redirects=False,
             ) as response:
                 await self._raise_for_status(response)
                 if response.status != 200 or response.content_type != "image/png":
@@ -898,8 +933,10 @@ class NativeClient:
         return await self._request(
             "GET",
             self.prefix
-            + "/groups/" + quote(thread, safe="")
-            + "/members/" + quote(username, safe=""),
+            + "/groups/"
+            + quote(thread, safe="")
+            + "/members/"
+            + quote(username, safe=""),
         )
 
     async def set_my_group_name(self, thread: str, name: str, key: str):
@@ -941,8 +978,8 @@ class NativeClient:
             "GET", self.prefix + "/messages/" + quote(message_id, safe="") + "/media"
         )
 
-    async def sticker_assets(self, message_id: str) -> list[dict]:
-        return await self._load_assets(message_id, "sticker", quoted=True)
+    async def sticker_assets(self, message_id: str, *, quoted: bool = True) -> list[dict]:
+        return await self._load_assets(message_id, "sticker", quoted=quoted)
 
     async def sticker_content(self, asset: dict, *, original=False) -> bytes:
         """Read only authenticated Native content, verifying its advertised identity."""
@@ -1097,8 +1134,15 @@ class NativeClient:
         self, message_id: str, kind: str, *, quoted: bool, guard=None
     ) -> list[dict]:
         _check_guard(guard)
-        media_label = {"file": "PDF", "voice": "语音", "image": "图片"}.get(kind, "媒体")
-        media_kind = "pdf" if kind == "file" else kind if kind in {"voice", "image"} else "image"
+        media_label = {
+            "file": "PDF",
+            "voice": "语音",
+            "image": "图片",
+            "sticker": "表情",
+        }.get(kind, "媒体")
+        media_kind = (
+            "pdf" if kind == "file" else kind if kind in {"voice", "image", "sticker"} else "image"
+        )
         logger.debug(
             "WeChat Native 查询%s资产：message=%s quoted=%s", media_label, message_id, quoted
         )

@@ -37,12 +37,32 @@ def is_sticker(raw):
 
 def quoted_sticker(raw):
     return (
-        raw.get("type") == 49
+        isinstance(raw, dict)
+        and raw.get("type") == 49
         and raw.get("appMessageType") == 57
         and is_sticker(raw.get("quote"))
         and raw["quote"].get("state") == "embedded"
         and raw["quote"].get("embeddedSticker") is True
     )
+
+
+def missing_sticker_quote(raw):
+    quote = raw.get("quote") if isinstance(raw, dict) else None
+    return (
+        isinstance(raw, dict)
+        and raw.get("type") == 49
+        and raw.get("appMessageType") == 57
+        and is_sticker(quote)
+        and quote.get("state") == "missing"
+        and isinstance(quote.get("serverId"), str)
+        and bool(quote["serverId"])
+        and isinstance(quote.get("senderId"), str)
+        and bool(quote["senderId"])
+    )
+
+
+def quoted_sticker_candidate(raw):
+    return quoted_sticker(raw) or missing_sticker_quote(raw)
 
 
 class StickerService:
@@ -87,7 +107,7 @@ class StickerService:
             and bool(raw["senderId"])
             and raw["senderId"] != self.adapter.bot_self_id
             and raw.get("recall") is None
-            and quoted_sticker(raw)
+            and quoted_sticker_candidate(raw)
             and self.adapter._check_timestamp(raw)
         )
 
@@ -134,17 +154,88 @@ class StickerService:
                 type(error).__name__,
             )
 
-    async def check_quote(self, raw):
+    async def _check_original_message(self, raw, original_id):
+        adapter = self.adapter
+        quote = raw.get("quote")
+        if (
+            not isinstance(quote, dict)
+            or not isinstance(original_id, str)
+            or not original_id
+            or adapter.state.message_status(original_id) == "recalled"
+            or adapter.state.is_recalled(raw["threadId"], quote.get("serverId"))
+        ):
+            raise MediaError(
+                "recalled"
+                if isinstance(quote, dict)
+                and (
+                    adapter.state.message_status(original_id) == "recalled"
+                    or adapter.state.is_recalled(raw["threadId"], quote.get("serverId"))
+                )
+                else "unavailable",
+                media_kind="sticker",
+            )
+        original = await adapter.client.message(original_id)
+        if (
+            not isinstance(original, dict)
+            or original.get("id") != original_id
+            or original.get("accountId") != adapter.native_config.account_id
+            or original.get("threadId") != raw["threadId"]
+            or original.get("serverId") != quote.get("serverId")
+            or original.get("senderId") != quote.get("senderId")
+            or not is_sticker(original)
+            or original.get("type") != quote.get("type")
+            or (
+                quote.get("type") == 49
+                and original.get("appMessageType") != quote.get("appMessageType")
+            )
+        ):
+            raise MediaError("unavailable", media_kind="sticker")
+        if original.get("recall") is not None:
+            raise MediaError("recalled", media_kind="sticker")
+
+    async def _resolve_quote_source(self, raw):
+        if quoted_sticker(raw):
+            return raw["id"], True
+        if not missing_sticker_quote(raw):
+            raise MediaError(
+                "recalled"
+                if isinstance(raw.get("quote"), dict) and raw["quote"].get("state") == "recalled"
+                else "unavailable",
+                media_kind="sticker",
+            )
+        quote = raw["quote"]
+        thread = raw["threadId"]
+        if self.adapter.state.is_recalled(thread, quote["serverId"]):
+            raise MediaError("recalled", media_kind="sticker")
+        original_id = self.adapter.state.find_message_id(thread, quote["serverId"])
+        if not original_id:
+            listing = await self.adapter.client.messages(thread, limit=50)
+            items = listing.get("items") if isinstance(listing, dict) else None
+            if isinstance(items, list):
+                matches = [
+                    item
+                    for item in items
+                    if isinstance(item, dict) and item.get("serverId") == quote["serverId"]
+                ]
+                if len(matches) == 1 and isinstance(matches[0].get("id"), str) and matches[0]["id"]:
+                    original_id = matches[0]["id"]
+        if not original_id:
+            raise MediaError("unavailable", media_kind="sticker")
+        await self._check_original_message(raw, original_id)
+        return original_id, False
+
+    async def check_quote(self, raw, *, source_message_id=None):
         adapter = self.adapter
         if (
             raw.get("accountId") != adapter.native_config.account_id
-            or not quoted_sticker(raw)
+            or not quoted_sticker_candidate(raw)
             or raw.get("recall") is not None
             or adapter.state.message_status(raw["id"]) == "recalled"
             or adapter.state.is_recalled(raw["threadId"], raw["quote"].get("serverId"))
         ):
             raise MediaError(
-                "recalled" if raw.get("quote", {}).get("state") == "recalled" else "unavailable"
+                "recalled" if raw.get("quote", {}).get("state") == "recalled" else "unavailable",
+                media_kind="sticker",
             )
         current = await adapter.client.message(raw["id"])
         if (
@@ -153,31 +244,40 @@ class StickerService:
                 for k in ("id", "accountId", "threadId", "serverId", "senderId")
             )
             or current.get("quote") != raw.get("quote")
-            or not quoted_sticker(current)
+            or not quoted_sticker_candidate(current)
         ):
-            raise MediaError("unavailable")
+            raise MediaError("unavailable", media_kind="sticker")
         if current.get("recall") is not None:
-            raise MediaError("recalled")
+            raise MediaError("recalled", media_kind="sticker")
+        if source_message_id and source_message_id != raw["id"]:
+            await self._check_original_message(raw, source_message_id)
 
-    async def read_quote(self, raw, *, original=False, guard=None):
+    async def read_quote_with_source(self, raw, *, original=False, guard=None):
         try:
             async with asyncio.timeout(self.adapter.client.media_timeout):
                 if guard:
                     guard()
-                await self.check_quote(raw)
-                assets = await self.adapter.client.sticker_assets(raw["id"])
+                source_message_id, is_embedded = await self._resolve_quote_source(raw)
+                await self.check_quote(raw, source_message_id=source_message_id)
+                assets = await self.adapter.client.sticker_assets(
+                    source_message_id, quoted=is_embedded
+                )
                 candidates = [a for a in assets if not original or a.get("variant") == "original"]
                 if not candidates:
-                    raise MediaError("unsupported_format")
+                    raise MediaError("unsupported_format", media_kind="sticker")
                 asset = sorted(candidates, key=lambda a: a.get("variant") != "original")[0]
                 if asset.get("state") == "pending":
-                    await self.transfer(raw, asset)
-                    assets = await self.adapter.client.sticker_assets(raw["id"])
+                    await self.transfer(raw, asset, source_message_id=source_message_id)
+                    assets = await self.adapter.client.sticker_assets(
+                        source_message_id, quoted=is_embedded
+                    )
                     asset = next((a for a in assets if a["id"] == asset["id"]), None)
                     if asset is None:
-                        raise MediaError("unavailable")
+                        raise MediaError("unavailable", media_kind="sticker")
                 data = await self.adapter.client.sticker_content(asset, original=original)
-                refreshed = await self.adapter.client.sticker_assets(raw["id"])
+                refreshed = await self.adapter.client.sticker_assets(
+                    source_message_id, quoted=is_embedded
+                )
                 latest = next((a for a in refreshed if a["id"] == asset["id"]), None)
                 if not latest or any(
                     latest.get(k) != asset.get(k)
@@ -191,17 +291,23 @@ class StickerService:
                         "preview",
                     )
                 ):
-                    raise MediaError("unavailable")
-                await self.check_quote(raw)
+                    raise MediaError("unavailable", media_kind="sticker")
+                await self.check_quote(raw, source_message_id=source_message_id)
                 if guard:
                     guard()
-                return data, asset
+                return data, asset, source_message_id
         except NativeAPIError as error:
             from .native_client import _map_media_code
 
-            raise _map_media_code(error.code, quoted=True, status=error.status) from None
+            raise _map_media_code(
+                error.code, quoted=True, status=error.status, media_kind="sticker"
+            ) from None
         except TimeoutError:
-            raise MediaError("unavailable") from None
+            raise MediaError("unavailable", media_kind="sticker") from None
+
+    async def read_quote(self, raw, *, original=False, guard=None):
+        data, asset, _ = await self.read_quote_with_source(raw, original=original, guard=guard)
+        return data, asset
 
     def claim(self, raw, action, content_id, source):
         digest = source_hash(source)
@@ -379,13 +485,14 @@ class StickerService:
             self.log_acquisition(row, "job_result", job)
         return result(action, state)
 
-    async def transfer(self, raw, asset):
+    async def transfer(self, raw, asset, *, source_message_id=None):
+        target_id = source_message_id or raw["id"]
         row, won = self.claim(
             raw,
             "transfer:" + asset["id"],
             asset["id"],
             {
-                "messageId": raw["id"],
+                "messageId": target_id,
                 "assetId": asset["id"],
                 "quality": "original",
             },
@@ -398,7 +505,7 @@ class StickerService:
                 outcome = await self.inspect(row)
             elif won:
                 job = await self.adapter.client.transfer_media(
-                    raw["id"],
+                    target_id,
                     asset_id=asset["id"],
                     key=row["idempotency_key"],
                 )
@@ -499,7 +606,7 @@ class StickerService:
                     caption=clean_caption,
                 )
             return outcome
-        if not quoted_sticker(raw):
+        if not quoted_sticker_candidate(raw):
             quote = raw.get("quote")
             reason = (
                 "sticker_original_recalled"
@@ -508,12 +615,12 @@ class StickerService:
             )
             raise ToolError("not_available", reason)
         try:
-            data, asset = await self.read_quote(raw, original=True)
+            data, asset, source_message_id = await self.read_quote_with_source(raw, original=True)
             content_id = hashlib.md5(data).hexdigest()
             saved = await self.adapter.client.custom_stickers()
             if not isinstance(saved.get("items"), list):
                 raise ToolError("not_available")
-            await self.check_quote(raw)
+            await self.check_quote(raw, source_message_id=source_message_id)
             authorize()
         except MediaError as error:
             raise ToolError("not_available", "sticker_original_" + error.reason) from None
@@ -522,7 +629,7 @@ class StickerService:
             "save",
             content_id,
             {
-                "messageId": raw["id"],
+                "messageId": source_message_id,
                 "assetId": asset["id"],
                 "contentId": content_id,
             },
@@ -557,7 +664,7 @@ class StickerService:
             )
             return result("save", "already_saved")
         try:
-            job = await self.adapter.client.save_sticker(raw["id"], asset["id"], key)
+            job = await self.adapter.client.save_sticker(source_message_id, asset["id"], key)
             outcome = await self.inspect(row, job)
             if outcome["status"] == "success":
                 await self._record_saved_label(
