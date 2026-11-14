@@ -84,6 +84,9 @@ _SAFE_CODES = {
     "media_audio_invalid",
     "unsupported_voice_chunk",
     "sticker_source_unavailable",
+    "sticker_source_not_allowed",
+    "sticker_source_dns_not_public",
+    "sticker_metadata_invalid",
     "sticker_pack_not_added",
     "custom_sticker_not_found",
     "unsupported_sticker_send_format",
@@ -93,6 +96,7 @@ _SAFE_CODES = {
     "sticker_pack_not_eligible",
     "sticker_pack_item_not_found",
     "sticker_pack_acquisition_rejected",
+    "sticker_pack_detail_rejected",
 }
 
 MEDIA_ERROR_MESSAGES = {
