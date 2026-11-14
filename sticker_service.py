@@ -39,6 +39,29 @@ class StickerService:
     def __init__(self, adapter):
         self.adapter = adapter
 
+    def log_quote(self, raw, stage):
+        quote = raw.get("quote")
+        quote = quote if isinstance(quote, dict) else {}
+        state = quote.get("state")
+        if state not in {"embedded", "missing", "unsupported", "recalled"}:
+            state = "unknown"
+        quote_type = quote.get("type")
+        app_type = quote.get("appMessageType")
+        logger.info(
+            "WeChat Native 引用表情诊断：message=%s stage=%s quote_type=%s "
+            "quote_app_type=%s quote_state=%s embedded_sticker=%s embedded_text=%s "
+            "enable_stickers=%s enable_media=%s",
+            raw.get("id"),
+            stage,
+            quote_type if type(quote_type) is int else None,
+            app_type if type(app_type) is int else None,
+            state,
+            quote.get("embeddedSticker") is True,
+            isinstance(quote.get("embeddedText"), str) and bool(quote["embeddedText"]),
+            self.adapter.native_config.enable_stickers,
+            self.adapter.native_config.enable_media,
+        )
+
     def auto_save_eligible(self, raw, origin="live"):
         cfg = self.adapter.native_config
         thread = raw.get("threadId", "")
@@ -279,11 +302,19 @@ class StickerService:
 
     async def _save_quote(self, raw, authorize):
         authorize()
+        self.log_quote(raw, "save")
         existing = self.adapter.state.sticker_operation(
             raw["accountId"], raw["threadId"], raw["id"], "save"
         )
         if existing:
             return await self.inspect(existing)
+        if not quoted_sticker(raw):
+            reason = (
+                "sticker_original_recalled"
+                if raw.get("quote", {}).get("state") == "recalled"
+                else "sticker_quote_unavailable"
+            )
+            raise ToolError("not_available", reason)
         try:
             data, asset = await self.read_quote(raw, original=True)
             content_id = hashlib.md5(data).hexdigest()
@@ -292,8 +323,8 @@ class StickerService:
                 raise ToolError("not_available")
             await self.check_quote(raw)
             authorize()
-        except MediaError:
-            raise ToolError("not_available", "sticker_original_unavailable") from None
+        except MediaError as error:
+            raise ToolError("not_available", "sticker_original_" + error.reason) from None
         row, won = self.claim(
             raw,
             "save",
@@ -374,7 +405,33 @@ class StickerService:
                         "pack_name": name if isinstance(name, str) and name != pack_id else "",
                     }
                 )
-        return items
+        diagnostics = {
+            "source": "native_profile",
+            "saved_count": len(saved["items"]),
+            "added_pack_count": sum(
+                isinstance(p, dict) and p.get("membership") == "added" for p in packs["items"]
+            ),
+            "candidate_count": len(items),
+            "native_version": None,
+        }
+        if not items:
+            try:
+                status = await self.adapter.client.status()
+                identity = status.get("version")
+                version = identity.get("version") if isinstance(identity, dict) else identity
+                if isinstance(version, str) and re.fullmatch(r"\d+\.\d+\.\d+(?:-[\w.]+)?", version):
+                    diagnostics["native_version"] = version
+            except NativeAPIError:
+                pass
+        logger.info(
+            "WeChat Native 表情目录诊断：saved_count=%s added_pack_count=%s "
+            "candidate_count=%s native_version=%s",
+            diagnostics["saved_count"],
+            diagnostics["added_pack_count"],
+            len(items),
+            diagnostics["native_version"] or "unknown",
+        )
+        return items, diagnostics
 
     async def find(self, event, query="", limit=12):
         ctx = context(event, stickers=True)
@@ -385,7 +442,7 @@ class StickerService:
             or not 1 <= limit <= 12
         ):
             raise ToolError("invalid_request")
-        catalog = await self.catalog()
+        catalog, diagnostics = await self.catalog()
         context(event, stickers=True)
         retained = event.get_extra("wechat_native_sticker_selections") or {}
         choices = []
@@ -413,7 +470,24 @@ class StickerService:
                 break
         # Prevent repeated searches from growing one event indefinitely.
         event.set_extra("wechat_native_sticker_selections", dict(list(retained.items())[-120:]))
-        return result("find", "success", items=choices, count=len(choices), untrusted_data=True)
+        output = result(
+            "find",
+            "success",
+            items=choices,
+            count=len(choices),
+            untrusted_data=True,
+            catalog=diagnostics,
+        )
+        if not choices:
+            output["reason"] = (
+                "sticker_query_no_match" if catalog else "native_sticker_catalog_empty"
+            )
+            output["message"] = (
+                "当前目录没有匹配该文字的候选，不能判断此前收藏是否成功。"
+                if catalog
+                else "Native 当前账号目录未返回可用表情，不能判断手机库存或此前收藏是否成功。"
+            )
+        return output
 
     async def validate_selection(self, source):
         if source["kind"] == "saved":

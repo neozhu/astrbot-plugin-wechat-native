@@ -963,6 +963,8 @@ class WeChatNativeAdapter(Platform):
         ):
             raise ValueError("message_identity_mismatch")
         origin = data.get("origin", "unknown")
+        if raw.get("type") == 49 and raw.get("appMessageType") == 57:
+            self.stickers.log_quote(raw, "receive")
         received = (
             origin == "live"
             and raw.get("direction") == "incoming"

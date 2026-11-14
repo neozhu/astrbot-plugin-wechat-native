@@ -63,6 +63,7 @@ class Native:
         self.post_status = 202
         self.last_kind = "sticker_saved"
         self.content_requests = []
+        self.native_version = "2.4.0"
 
     def job(self, kind="sticker_saved", job_id="job1"):
         return {
@@ -84,6 +85,8 @@ class Native:
         body = await req.json() if req.method == "POST" else None
         self.calls.append((req.method, req.path, body, req.headers.get("Idempotency-Key")))
         path = req.path
+        if path.endswith("/status"):
+            return web.json_response({"version": {"version": self.native_version}})
         if req.method == "POST":
             if self.post_status != 202:
                 return web.json_response({}, status=self.post_status)
@@ -947,5 +950,64 @@ async def test_wechat_text_faces_are_preserved_in_quote_component(serve, tmp_pat
         )
         assert not any(isinstance(c, Image) for c in event.message_obj.message)
         assert not any(c[0] == "POST" or c[1].endswith("/media") for c in native.calls)
+    finally:
+        await adapter.terminate()
+
+
+async def test_empty_catalog_reports_native_counts_without_claiming_save_failure(
+    serve, tmp_path, caplog
+):
+    native, adapter, event = await send_event(serve, tmp_path)
+    native.saved, native.packs = [], []
+    try:
+        data = await find(event)
+        assert data["ok"] and data["items"] == []
+        assert data["reason"] == "native_sticker_catalog_empty"
+        assert data["catalog"]["saved_count"] == 0
+        assert data["catalog"]["added_pack_count"] == 0
+        assert data["catalog"]["native_version"] == "2.4.0"
+        assert "不能判断" in data["message"]
+        assert "saved_count=0 added_pack_count=0" in caplog.text
+        assert not any(c[0] == "POST" for c in native.calls)
+    finally:
+        await adapter.terminate()
+
+
+async def test_query_no_match_keeps_nonempty_catalog_counts(serve, tmp_path):
+    native, adapter, event = await send_event(serve, tmp_path)
+    try:
+        data = await find(event, "没有这种描述")
+        assert data["ok"] and data["items"] == []
+        assert data["reason"] == "sticker_query_no_match"
+        assert data["catalog"]["saved_count"] == 1
+        assert data["catalog"]["added_pack_count"] == 1
+    finally:
+        await adapter.terminate()
+
+
+@pytest.mark.parametrize(
+    "change,reason",
+    [
+        ({"embeddedSticker": False}, "sticker_quote_unavailable"),
+        ({"state": "unsupported"}, "sticker_quote_unavailable"),
+        ({"state": "recalled"}, "sticker_original_recalled"),
+    ],
+)
+async def test_save_explains_unavailable_quote_instead_of_generic_failure(
+    serve, tmp_path, caplog, change, reason
+):
+    raw = quoted(**change)
+    raw["quote"]["embeddedText"] = "synthetic-secret-body"
+    native, adapter = await setup(serve, tmp_path, raw)
+    try:
+        event = await deliver(adapter, native.raw)
+        data = await save(event)
+        assert data["status"] == "not_available"
+        assert data["reason"] == reason
+        assert "引用" in data["message"]
+        assert "quote_type=47" in caplog.text
+        assert "embedded_sticker=" in caplog.text
+        assert "synthetic-secret-body" not in caplog.text
+        assert not any(c[0] == "POST" for c in native.calls)
     finally:
         await adapter.terminate()

@@ -28,6 +28,16 @@ MESSAGES = {
     "failed": "操作未能完成",
 }
 
+STICKER_ERROR_MESSAGES = {
+    "sticker_quote_unavailable": "当前引用没有携带可读取的表情内容，请重新引用原表情发送。",
+    "sticker_original_unavailable": "引用表情的可验证原图暂时不可用，尚未提交收藏。",
+    "sticker_original_expired": "引用表情的原图已失效，请重新发送并引用。",
+    "sticker_original_recalled": "引用表情或承载引用的消息已撤回，未提交收藏。",
+    "sticker_original_unsupported_format": "引用表情的原图格式暂不支持收藏，未提交收藏。",
+    "sticker_original_missing_scope": "读取引用表情的权限不足，请检查 Native 的媒体权限。",
+    "sticker_original_too_large": "引用表情的原图超过处理限制，未提交收藏。",
+}
+
 
 class ToolError(Exception):
     def __init__(self, status, reason="business_state"):
@@ -61,17 +71,27 @@ def encode(value):
 
 def error_result(action, error):
     error_type = type(error)
-    # importlib.reload replaces ToolError, but existing action instances retain
-    # its old class. Trust only classes defined in this module's namespace;
-    # matching an exception name or status attribute alone is insufficient.
+    reason = None
+    initializer = error_type.__init__
+    namespace = getattr(initializer, "__globals__", None)
+    # AstrBot may replace the module object while an existing adapter retains
+    # the old class. A matching name alone is not a trusted business exception.
+    same_source_generation = (
+        isinstance(namespace, dict)
+        and namespace.get("__name__") == ToolError.__module__
+        and namespace.get("ToolError") is error_type
+        and getattr(getattr(initializer, "__code__", None), "co_filename", None)
+        == ToolError.__init__.__code__.co_filename
+    )
     local_tool_error = (
         error_type.__module__ == ToolError.__module__
         and error_type.__qualname__ == ToolError.__qualname__
-        and getattr(error_type.__init__, "__globals__", None) is globals()
+        and (namespace is globals() or same_source_generation)
         and getattr(error, "status", None) in MESSAGES
     )
     if isinstance(error, ToolError) or local_tool_error:
         status = error.status
+        reason = error.reason
         logger.warning(
             "WeChat Native 工具拒绝：action=%s status=%s reason=%s", action, status, error.reason
         )
@@ -97,6 +117,8 @@ def error_result(action, error):
         # No exception repr/trace: upstream errors can embed secrets or chat text.
         logger.warning("WeChat Native 工具失败：action=%s type=%s", action, type(error).__name__)
         status = "failed"
+    if action == "save" and reason in STICKER_ERROR_MESSAGES:
+        return result(action, status, reason=reason, message=STICKER_ERROR_MESSAGES[reason])
     return result(action, status)
 
 

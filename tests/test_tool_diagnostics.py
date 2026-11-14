@@ -1,5 +1,6 @@
 import importlib
 import json
+from pathlib import Path
 
 import pytest
 from aiohttp import web
@@ -45,6 +46,29 @@ def test_foreign_tool_error_is_not_trusted(caplog):
     error.reason = "synthetic-secret"
     assert support.error_result("recall_own_message", error)["status"] == "failed"
     assert "synthetic-secret" not in caplog.text
+
+
+@pytest.mark.parametrize("direction", ["old_error", "new_error"])
+def test_business_errors_survive_full_module_reimport(caplog, direction):
+    support = module("tool_support")
+    namespace = {
+        "__name__": support.__name__,
+        "__package__": support.__package__,
+        "__file__": support.__file__,
+    }
+    exec(
+        compile(Path(support.__file__).read_text(encoding="utf-8"), support.__file__, "exec"),
+        namespace,
+    )
+    old_error = support.ToolError("not_available", "sticker_original_unavailable")
+    new_error = namespace["ToolError"]("not_available", "sticker_original_unavailable")
+    handler, error = (
+        (namespace["error_result"], old_error)
+        if direction == "old_error"
+        else (support.error_result, new_error)
+    )
+    assert handler("save", error)["status"] == "not_available"
+    assert "reason=sticker_original_unavailable" in caplog.text
 
 
 async def test_disabled_history_logs_runtime_reason_without_request(serve, tmp_path, caplog):
