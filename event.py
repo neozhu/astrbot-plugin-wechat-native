@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import io
 import re
 from datetime import UTC, datetime
 from urllib.parse import quote, unquote
@@ -13,6 +14,26 @@ from astrbot.api.platform import AstrBotMessage, Group, MessageMember, MessageTy
 from .config import DEFAULT_IMAGE_PROMPT, DEFAULT_PDF_PROMPT
 
 PDF_CONTEXT_MARKER = "[PDF 文件内容｜文件名："
+
+
+def sticker_preview(data: bytes) -> bytes:
+    """Deliver a bounded representative frame, without claiming animation understanding."""
+    from PIL import Image as PILImage
+
+    from .native_client import MediaError
+
+    try:
+        with PILImage.open(io.BytesIO(data)) as image:
+            if image.width * image.height > 16_000_000:
+                raise MediaError("too_large")
+            image.seek(0)
+            output = io.BytesIO()
+            image.convert("RGBA").save(output, format="PNG")
+            return output.getvalue()
+    except PILImage.DecompressionBombError:
+        raise MediaError("too_large") from None
+    except (OSError, ValueError):
+        raise MediaError("unsupported_format") from None
 
 
 def pdf_context_text(name: str, text: str) -> str:
@@ -71,6 +92,7 @@ def convert_message(
     image_bytes: bytes | None = None,
     pdf_name: str | None = None,
     voice_bytes: bytes | None = None,
+    sticker: bool = False,
 ) -> AstrBotMessage:
     result = AstrBotMessage()
     thread, sender = raw["threadId"], raw["senderId"]
@@ -113,7 +135,9 @@ def convert_message(
     if raw.get("type") == 49 and raw.get("appMessageType") == 57 and isinstance(quote, dict):
         state = quote.get("state")
         quoted_text = "引用消息内容不可用"
-        if image_bytes is not None and quote.get("type") == 3:
+        if sticker and image_bytes is not None:
+            quoted_text = "[表情预览，仅代表静态帧，不代表完整动画]"
+        elif image_bytes is not None and quote.get("type") == 3:
             if (
                 state == "embedded"
                 and isinstance(quote.get("embeddedText"), str)
@@ -228,6 +252,19 @@ class WeChatNativeEvent(AstrMessageEvent):
             self.stop_event()
             return
         if status in {"needs_review", "failed", "partial"}:
+            sticker = (
+                self.adapter.state.sticker_operation(
+                    self.adapter.native_config.account_id,
+                    raw["threadId"],
+                    self.message_obj.message_id,
+                    "send",
+                )
+                if raw and isinstance(raw.get("threadId"), str)
+                else None
+            )
+            if sticker and sticker["state"] in {"submitting", "pending", "needs_review"}:
+                self.stop_event()
+                return
             raise RuntimeError("此消息的回复需人工检查，禁止自动重发")
         try:
             sent = await self.adapter.send_chain(

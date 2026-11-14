@@ -6,6 +6,7 @@ handoff is therefore retained for review rather than automatically handed off tw
 
 import hashlib
 import sqlite3
+import time
 from contextlib import closing
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -85,6 +86,13 @@ def cursor_number(value: str) -> int:
     return int(value)
 
 
+def clean_sticker_caption(value: str | None) -> str:
+    if not isinstance(value, str):
+        return ""
+    cleaned = "".join(" " if ord(c) < 32 or ord(c) == 127 else c for c in value)
+    return " ".join(cleaned.split())[:160]
+
+
 class StateIdentityError(RuntimeError):
     """Stored identity changed; preserve evidence and require operator inspection."""
 
@@ -125,6 +133,28 @@ class StateStore:
                 key TEXT NOT NULL, part INTEGER NOT NULL, state TEXT NOT NULL,
                 duration_ms INTEGER NOT NULL, server_id TEXT,
                 PRIMARY KEY(key, part));
+            CREATE TABLE IF NOT EXISTS sticker_operations (
+                account TEXT NOT NULL, thread TEXT NOT NULL, trigger_message_id TEXT NOT NULL,
+                action TEXT NOT NULL, content_id TEXT NOT NULL,
+                idempotency_key TEXT NOT NULL UNIQUE, source_hash TEXT NOT NULL,
+                job_id TEXT, state TEXT NOT NULL, created_at REAL NOT NULL,
+                updated_at REAL NOT NULL, server_message_id TEXT,
+                UNIQUE(account, thread, trigger_message_id, action));
+            CREATE UNIQUE INDEX IF NOT EXISTS sticker_save_inflight
+                ON sticker_operations(account, content_id)
+                WHERE action='save' AND state IN ('pending','submitting','needs_review');
+            CREATE UNIQUE INDEX IF NOT EXISTS sticker_acquire_inflight
+                ON sticker_operations(account, action, content_id)
+                WHERE action LIKE 'acquire:%'
+                    AND state IN ('pending','submitting','needs_review');
+            CREATE TABLE IF NOT EXISTS sticker_labels (
+                account TEXT NOT NULL,
+                content_id TEXT NOT NULL,
+                caption TEXT NOT NULL DEFAULT '',
+                ready_gif INTEGER NOT NULL DEFAULT 0,
+                content_type TEXT NOT NULL DEFAULT '',
+                updated_at REAL NOT NULL,
+                PRIMARY KEY(account, content_id));
         """)
         with self.db:
             self.db.execute(
@@ -140,6 +170,9 @@ class StateStore:
             self.db.execute("UPDATE messages SET status='needs_review' WHERE status='queued'")
             self.db.execute("UPDATE sends SET state='needs_review' WHERE state='submitting'")
             self.db.execute(
+                "UPDATE sticker_operations SET state='needs_review' WHERE state='submitting'"
+            )
+            self.db.execute(
                 "UPDATE messages SET status=CASE WHEN status='replied' THEN 'partial' "
                 "ELSE 'needs_review' END WHERE status IN ('replied','no_reply') "
                 "AND EXISTS (SELECT 1 FROM sends WHERE sends.message_id=messages.id "
@@ -151,6 +184,156 @@ class StateStore:
             "SELECT until FROM cooldowns WHERE account=? AND thread=?", (account, thread)
         ).fetchone()
         return row[0] if row else 0.0
+
+    def is_recalled(self, thread, server_id):
+        return (
+            self.db.execute(
+                "SELECT 1 FROM recalls WHERE thread=? AND server_id=?", (thread, server_id)
+            ).fetchone()
+            is not None
+        )
+
+    def sticker_operation(self, account, thread, trigger, action):
+        row = self.db.execute(
+            "SELECT * FROM sticker_operations WHERE account=? AND thread=? "
+            "AND trigger_message_id=? AND action=?",
+            (account, thread, trigger, action),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def claim_sticker(self, account, thread, trigger, action, content_id, key, source_hash, now):
+        if not content_id:
+            raise ValueError("sticker_content_identity_required")
+        with self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            existing = self.sticker_operation(account, thread, trigger, action)
+            if not existing and (action == "save" or action.startswith("acquire:")):
+                row = self.db.execute(
+                    "SELECT * FROM sticker_operations WHERE account=? AND content_id=? "
+                    "AND action=? AND state IN ('pending','submitting','needs_review')",
+                    (account, content_id, action),
+                ).fetchone()
+                if row:
+                    existing = dict(row)
+            if existing:
+                # Pack acquisition without a Native job ID never received an admission
+                # receipt; reclaim the same idempotency key instead of deadlocking forever.
+                if (
+                    action.startswith("acquire:")
+                    and existing["state"] == "needs_review"
+                    and not existing["job_id"]
+                ):
+                    self.db.execute(
+                        "UPDATE sticker_operations SET state='submitting', updated_at=? "
+                        "WHERE idempotency_key=? AND state='needs_review' AND job_id IS NULL",
+                        (now, existing["idempotency_key"]),
+                    )
+                    reclaimed = self.db.execute(
+                        "SELECT * FROM sticker_operations WHERE idempotency_key=?",
+                        (existing["idempotency_key"],),
+                    ).fetchone()
+                    return dict(reclaimed), True
+                return existing, False
+            if action == "send" and thread.endswith("@chatroom"):
+                if self.db.execute(
+                    "SELECT 1 FROM sticker_operations WHERE account=? AND thread=? "
+                    "AND action='send' AND created_at>? LIMIT 1",
+                    (account, thread, now - 30),
+                ).fetchone():
+                    return None, False
+            self.db.execute(
+                "INSERT INTO sticker_operations VALUES "
+                "(?, ?, ?, ?, ?, ?, ?, NULL, 'submitting', ?, ?, NULL)",
+                (account, thread, trigger, action, content_id, key, source_hash, now, now),
+            )
+            return self.sticker_operation(account, thread, trigger, action), True
+
+    def finish_sticker(self, key, state, job_id=None, server_message_id=None):
+        with self.db:
+            self.db.execute(
+                "UPDATE sticker_operations SET state=?, job_id=COALESCE(?,job_id), "
+                "server_message_id=COALESCE(?,server_message_id), "
+                "updated_at=CAST(strftime('%s','now') AS REAL) WHERE idempotency_key=? "
+                "AND state NOT IN ('success','already_saved','failed')",
+                (state, job_id, server_message_id, key),
+            )
+
+    def pending_stickers(self, account):
+        return [
+            dict(r)
+            for r in self.db.execute(
+                "SELECT * FROM sticker_operations WHERE account=? "
+                "AND state IN ('pending','submitting','needs_review') ORDER BY created_at",
+                (account,),
+            )
+        ]
+
+    def complete_sticker_send(self, key, job_id, server_id):
+        """Commit the accepted receipt, outbox and source status atomically."""
+        with self.db:
+            self.db.execute(
+                "UPDATE sticker_operations SET state='success', job_id=?, server_message_id=?, "
+                "updated_at=CAST(strftime('%s','now') AS REAL) WHERE idempotency_key=?",
+                (job_id, server_id, key),
+            )
+            self.db.execute(
+                "UPDATE sends SET state='accepted', send_id=? WHERE key=?", (job_id, key)
+            )
+            self.db.execute(
+                "UPDATE messages SET status='replied' WHERE (id,thread) IN "
+                "(SELECT trigger_message_id,thread FROM sticker_operations "
+                "WHERE idempotency_key=?) "
+                "AND status!='recalled' AND NOT EXISTS "
+                "(SELECT 1 FROM sends WHERE message_id=messages.id AND state!='accepted')",
+                (key,),
+            )
+
+    def sticker_label(self, account: str, content_id: str) -> dict | None:
+        row = self.db.execute(
+            "SELECT * FROM sticker_labels WHERE account=? AND content_id=?",
+            (account, content_id.lower()),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def sticker_labels(self, account: str) -> dict[str, dict]:
+        rows = self.db.execute(
+            "SELECT * FROM sticker_labels WHERE account=?", (account,)
+        ).fetchall()
+        return {row["content_id"]: dict(row) for row in rows}
+
+    def upsert_sticker_label(
+        self,
+        account: str,
+        content_id: str,
+        *,
+        caption: str | None = None,
+        ready_gif: bool | None = None,
+        content_type: str | None = None,
+    ):
+        cleaned = clean_sticker_caption(caption) if caption is not None else ""
+        now = time.time()
+        with self.db:
+            existing = self.sticker_label(account, content_id)
+            next_caption = cleaned if cleaned else (existing["caption"] if existing else "")
+            next_ready = (
+                (1 if ready_gif else 0)
+                if ready_gif is not None
+                else (existing["ready_gif"] if existing else 0)
+            )
+            next_type = (
+                content_type[:64]
+                if content_type is not None
+                else (existing["content_type"] if existing else "")
+            )
+            self.db.execute(
+                "INSERT INTO sticker_labels "
+                "(account, content_id, caption, ready_gif, content_type, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(account, content_id) DO UPDATE SET "
+                "caption=excluded.caption, ready_gif=excluded.ready_gif, "
+                "content_type=excluded.content_type, updated_at=excluded.updated_at",
+                (account, content_id.lower(), next_caption, next_ready, next_type, now),
+            )
 
     def action_intent(self, account, thread, trigger):
         row = self.db.execute(

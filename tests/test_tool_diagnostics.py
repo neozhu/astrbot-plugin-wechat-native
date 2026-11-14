@@ -1,11 +1,13 @@
 import importlib
 import json
+from pathlib import Path
 
 import pytest
 from aiohttp import web
 from astrbot.api import logger  # noqa: F401
 from conftest import module
 from test_history_tools import tool_event
+from test_stickers import find, save, save_event, send_event
 
 
 @pytest.mark.parametrize(
@@ -45,6 +47,29 @@ def test_foreign_tool_error_is_not_trusted(caplog):
     error.reason = "synthetic-secret"
     assert support.error_result("recall_own_message", error)["status"] == "failed"
     assert "synthetic-secret" not in caplog.text
+
+
+@pytest.mark.parametrize("direction", ["old_error", "new_error"])
+def test_business_errors_survive_full_module_reimport(caplog, direction):
+    support = module("tool_support")
+    namespace = {
+        "__name__": support.__name__,
+        "__package__": support.__package__,
+        "__file__": support.__file__,
+    }
+    exec(
+        compile(Path(support.__file__).read_text(encoding="utf-8"), support.__file__, "exec"),
+        namespace,
+    )
+    old_error = support.ToolError("not_available", "sticker_original_unavailable")
+    new_error = namespace["ToolError"]("not_available", "sticker_original_unavailable")
+    handler, error = (
+        (namespace["error_result"], old_error)
+        if direction == "old_error"
+        else (support.error_result, new_error)
+    )
+    assert handler("save", error)["status"] == "not_available"
+    assert "reason=sticker_original_unavailable" in caplog.text
 
 
 async def test_disabled_history_logs_runtime_reason_without_request(serve, tmp_path, caplog):
@@ -155,5 +180,155 @@ async def test_reinjected_event_keeps_adapter_ownership(serve, tmp_path, monkeyp
         assert accepted["ok"] is True
         rejected = json.loads(await plugin.wechat_get_recent_messages(event))
         assert rejected["status"] == "not_available"
+    finally:
+        await adapter.terminate()
+
+
+async def test_sticker_tool_replaces_retained_service_after_plugin_reload(serve, tmp_path):
+    native, adapter, event = await send_event(serve, tmp_path)
+    current_service = module("sticker_service").StickerService
+
+    async def legacy_find(self, event, query="", limit=12):
+        return {"ok": True, "status": "success", "action": "find", "items": [], "count": 0}
+
+    previous_service = type(
+        "StickerService",
+        (current_service,),
+        {"__module__": current_service.__module__, "find": legacy_find},
+    )
+    adapter.stickers = previous_service(adapter)
+    try:
+        result = await find(event)
+        assert result["catalog"]["saved_count"] == 1
+        assert result["catalog"]["added_pack_count"] == 1
+        assert result["count"] == 2
+        assert not any(c[0] == "POST" for c in native.calls)
+    finally:
+        await adapter.terminate()
+
+
+async def test_replacing_retained_sticker_service_preserves_unknown_intent(serve, tmp_path):
+    native, adapter, event = await save_event(serve, tmp_path)
+    native.post_status = 503
+    assert (await save(event))["status"] == "needs_review"
+    current_service = module("sticker_service").StickerService
+
+    async def legacy_save(self, event):
+        return {"ok": False, "status": "failed", "action": "save"}
+
+    previous_service = type(
+        "StickerService",
+        (current_service,),
+        {"__module__": current_service.__module__, "save": legacy_save},
+    )
+    adapter.stickers = previous_service(adapter)
+    try:
+        assert (await save(event))["status"] == "needs_review"
+        assert len([c for c in native.calls if c[0] == "POST"]) == 1
+    finally:
+        await adapter.terminate()
+
+
+async def test_saved_detail_and_send_use_current_transport_with_retained_pre_upgrade_client(
+    serve, tmp_path
+):
+    from test_stickers import CONTENT_ID, find, send_event, send_sticker
+
+    native, adapter, event = await send_event(serve, tmp_path)
+    original_request = adapter.client._request
+    detail = dict(native.saved[0])
+    native.saved[0] = {"id": CONTENT_ID, "caption": "开心", "original": None}
+
+    async def handle_detail(method, path, **kwargs):
+        if method == "GET" and path.endswith(f"/custom-stickers/{CONTENT_ID}"):
+            native.calls.append((method, path, None, None))
+            return detail
+        return await original_request(method, path, **kwargs)
+
+    adapter.client._request = handle_detail
+    current = type(adapter.client)
+    # Retain the actual HTTP client/session, with the class API from before the update.
+    retained = type(
+        "NativeClient",
+        (),
+        {
+            name: member
+            for name, member in vars(current).items()
+            if name not in {"custom_sticker", "__dict__", "__weakref__"}
+        },
+    )
+    adapter.client.__class__ = retained
+    assert not hasattr(adapter.client, "custom_sticker")
+    session = adapter.client._session
+    try:
+        selection = (await find(event, "开心"))["items"][0]["selection_id"]
+        outcome = await send_sticker(event, selection)
+        assert outcome["status"] == "success", outcome
+        assert adapter.client._session is session
+        posts = [c for c in native.calls if c[0] == "POST"]
+        assert [c[1].rsplit("/", 1)[1] for c in posts] == ["sends"]
+    finally:
+        await adapter.terminate()
+
+
+@pytest.mark.parametrize(
+    "fault", ["missing_receipt", "job_review", "foreign_job", "media_rejected"]
+)
+async def test_legacy_acquisition_recovery_logs_failure_boundary_without_reposting(
+    serve, tmp_path, caplog, fault
+):
+    native, adapter, event = await send_event(serve, tmp_path)
+    row, _ = adapter.stickers.claim(
+        native.raw,
+        "acquire:pack1",
+        "b" * 32,
+        {"kind": "pack", "packId": "pack1", "stickerId": "b" * 32},
+    )
+    if fault == "missing_receipt":
+        adapter.state.finish_sticker(row["idempotency_key"], "needs_review")
+    else:
+        adapter.state.finish_sticker(row["idempotency_key"], "pending", "job1")
+        original = native.job
+
+        def job(kind="sticker_saved", job_id="job1"):
+            value = original(kind, job_id)
+            if kind == "sticker_acquire":
+                if fault == "media_rejected":
+                    value.update(
+                        state="failed",
+                        phase="downloading",
+                        reason="media_service_rejected",
+                        message="synthetic-secret",
+                    )
+                    value["result"] = {"serverAcceptance": "accepted"}
+                else:
+                    value.update(
+                        state="needs_review",
+                        phase="submitting",
+                        reason="sticker_submission_needs_review",
+                    )
+                    value["result"] = {"serverAcceptance": "pending", "private": "synthetic-secret"}
+                    if fault == "foreign_job":
+                        value["accountId"] = "synthetic-secret"
+                        value["kind"] = "synthetic-secret"
+            return value
+
+        native.job = job
+    try:
+        native.last_kind = "sticker_acquire"
+        await adapter.stickers.recover()
+        if fault == "missing_receipt":
+            assert "stage=missing_receipt" in caplog.text
+        elif fault == "media_rejected":
+            assert (
+                "native_state=failed native_phase=downloading "
+                "native_code=media_service_rejected acceptance=accepted"
+            ) in caplog.text
+        else:
+            assert "native_state=needs_review native_phase=submitting" in caplog.text
+            assert "native_code=sticker_submission_needs_review" in caplog.text
+            assert f"identity_matches={fault != 'foreign_job'}" in caplog.text
+        assert "synthetic-secret" not in caplog.text
+        assert not any(c[0] == "POST" for c in native.calls)
     finally:
         await adapter.terminate()

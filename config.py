@@ -35,6 +35,7 @@ DEFAULT_CONFIG = {
     "token_file": "/run/secrets/wechat-api-token",
     "enable_private_reply": True,
     "enable_media": True,
+    "enable_stickers": False,
     "allowed_users": [],
     "group_reply_mode": "mention",
     "group_reply_style": "mention",
@@ -51,6 +52,11 @@ DEFAULT_CONFIG = {
 }
 
 CONFIG_METADATA = {
+    "enable_stickers": {
+        "type": "bool",
+        "description": "启用原生表情读取、收藏与发送",
+        "hint": "Native v2.4.0；群聊引用自动去重收藏，无需管理员或 @；视觉识别使用媒体开关。",
+    },
     "enable_wechat_actions": {
         "type": "bool",
         "description": "启用微信修改与撤回工具",
@@ -188,6 +194,7 @@ class NativeConfig:
     token_file: str = field(repr=False)
     enable_private_reply: bool = True
     enable_media: bool = True
+    enable_stickers: bool = False
     allowed_users: frozenset[str] = frozenset()
     group_reply_mode: str = "mention"
     group_reply_style: str = "mention"
@@ -231,6 +238,7 @@ class NativeConfig:
         for key in (
             "enable_private_reply",
             "enable_media",
+            "enable_stickers",
             "enable_group_red_packet_reply",
             "unique_session",
             "enable_group_summary",
@@ -261,6 +269,7 @@ class NativeConfig:
             token_file=data.get("token_file", ""),
             enable_private_reply=data.get("enable_private_reply", True),
             enable_media=data.get("enable_media", True),
+            enable_stickers=data.get("enable_stickers", False),
             group_reply_mode=mode,
             group_reply_style=style,
             enable_group_red_packet_reply=data.get("enable_group_red_packet_reply", False),
