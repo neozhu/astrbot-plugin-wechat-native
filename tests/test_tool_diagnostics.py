@@ -227,3 +227,93 @@ async def test_replacing_retained_sticker_service_preserves_unknown_intent(serve
         assert len([c for c in native.calls if c[0] == "POST"]) == 1
     finally:
         await adapter.terminate()
+
+
+async def test_pack_send_uses_current_transport_with_retained_pre_upgrade_client(serve, tmp_path):
+    from test_stickers import find, send_event, send_sticker
+
+    native, adapter, event = await send_event(serve, tmp_path)
+    native.pack_items[0]["original"] = None
+    current = type(adapter.client)
+    # Retain the actual HTTP client/session, with the class API from before the update.
+    retained = type(
+        "NativeClient",
+        (),
+        {
+            name: member
+            for name, member in vars(current).items()
+            if name not in {"download_sticker", "__dict__", "__weakref__"}
+        },
+    )
+    adapter.client.__class__ = retained
+    assert not hasattr(adapter.client, "download_sticker")
+    session = adapter.client._session
+    try:
+        selection = (await find(event, "晚安"))["items"][0]["selection_id"]
+        outcome = await send_sticker(event, selection)
+        assert outcome["status"] == "success", outcome
+        assert adapter.client._session is session
+        posts = [c for c in native.calls if c[0] == "POST"]
+        assert [c[1].rsplit("/", 1)[1] for c in posts] == ["sticker-downloads", "sends"]
+    finally:
+        await adapter.terminate()
+
+
+@pytest.mark.parametrize("fault", ["http", "missing_receipt", "job_review", "foreign_job"])
+async def test_acquisition_logs_distinguish_failure_boundary_without_reposting(
+    serve, tmp_path, caplog, fault
+):
+    from test_stickers import send_sticker
+
+    native, adapter, event = await send_event(serve, tmp_path)
+    native.pack_items[0]["original"] = None
+    if fault == "http":
+        native.post_status = 503
+        native.post_error_code = "media_queue_full"
+    elif fault == "missing_receipt":
+        row, _ = adapter.stickers.claim(
+            native.raw,
+            "acquire:pack1",
+            "b" * 32,
+            {"kind": "pack", "packId": "pack1", "stickerId": "b" * 32},
+        )
+        adapter.state.finish_sticker(row["idempotency_key"], "needs_review")
+    else:
+        original = native.job
+
+        def job(kind="sticker_saved", job_id="job1"):
+            value = original(kind, job_id)
+            if kind == "sticker_acquire":
+                value.update(
+                    state="needs_review",
+                    phase="submitting",
+                    reason="sticker_submission_needs_review",
+                )
+                value["result"] = {"serverAcceptance": "pending", "private": "synthetic-secret"}
+                if fault == "foreign_job":
+                    value["accountId"] = "synthetic-secret"
+                    value["kind"] = "synthetic-secret"
+            return value
+
+        native.job = job
+    try:
+        selection = (await find(event, "晚安"))["items"][0]["selection_id"]
+        assert (await send_sticker(event, selection))[
+            "reason"
+        ] == "sticker_acquisition_needs_review"
+        if fault == "http":
+            assert "stage=submit http=503 code=media_queue_full" in caplog.text
+        elif fault == "missing_receipt":
+            assert "stage=missing_receipt" in caplog.text
+        else:
+            assert "native_state=needs_review native_phase=submitting" in caplog.text
+            assert "native_code=sticker_submission_needs_review" in caplog.text
+            assert f"identity_matches={fault != 'foreign_job'}" in caplog.text
+        assert "synthetic-secret" not in caplog.text
+        posts = [c for c in native.calls if c[0] == "POST"]
+        await send_sticker(event, selection)
+        await adapter.stickers.recover()
+        assert len([c for c in native.calls if c[0] == "POST"]) == len(posts)
+        assert not any(c[1].endswith("/sends") for c in posts)
+    finally:
+        await adapter.terminate()

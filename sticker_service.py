@@ -10,7 +10,7 @@ import uuid
 from astrbot.api import logger
 
 from .config import MAX_IMAGE_BYTES
-from .native_client import MediaError, NativeAPIError, SendError
+from .native_client import _SAFE_CODES, MediaError, NativeAPIError, NativeClient, SendError
 from .tool_support import ToolError, context, result
 
 
@@ -208,8 +208,87 @@ class StickerService:
             time.time(),
         )
 
+    def log_acquisition(self, row, stage, job=None, error=None):
+        """Log only receipt identity, known enums/codes and comparison booleans."""
+        job = job if isinstance(job, dict) else {}
+        native_state, phase, code = job.get("state"), job.get("phase"), job.get("reason")
+        native_state = (
+            native_state
+            if isinstance(native_state, str)
+            and native_state
+            in {
+                "queued",
+                "running",
+                "available",
+                "needs_review",
+                "failed",
+                "cancelled",
+                "expired",
+                "unsupported",
+            }
+            else "unknown"
+        )
+        phase = (
+            phase
+            if isinstance(phase, str)
+            and phase
+            in {
+                "queued",
+                "preparing",
+                "downloading",
+                "reserving",
+                "uploading",
+                "submitting",
+                "readback",
+                "projecting",
+                "completed",
+            }
+            else "unknown"
+        )
+        code = code if isinstance(code, str) and code in _SAFE_CODES else "unknown"
+        identity_matches = (
+            job.get("accountId") == row["account"]
+            and job.get("kind") == "sticker_acquire"
+            and isinstance(job.get("id"), str)
+            and bool(job["id"])
+            and (not row["job_id"] or job["id"] == row["job_id"])
+        )
+        payload = job.get("result")
+        payload = payload if isinstance(payload, dict) else {}
+        acceptance = payload.get("serverAcceptance")
+        acceptance = (
+            acceptance
+            if isinstance(acceptance, str)
+            and acceptance
+            in {
+                "pending",
+                "accepted",
+                "not_attempted",
+                "rejected",
+                "reconciled_noop",
+            }
+            else "unknown"
+        )
+        logger.warning(
+            "WeChat Native 表情获取诊断：stage=%s http=%s code=%s "
+            "receipt_key=%s job_id=%s identity_matches=%s native_state=%s "
+            "native_phase=%s native_code=%s acceptance=%s error_type=%s",
+            stage,
+            error.status if isinstance(error, NativeAPIError) else None,
+            error.code if isinstance(error, NativeAPIError) else "none",
+            row["idempotency_key"],
+            job["id"] if identity_matches else row["job_id"],
+            identity_matches,
+            native_state,
+            phase,
+            code,
+            acceptance,
+            type(error).__name__ if error else "none",
+        )
+
     async def inspect(self, row, job=None):
         action, key = row["action"], row["idempotency_key"]
+        acquiring = action.startswith("acquire:")
         if action == "send":
             return await self.inspect_send(row)
         if row["state"] in {"success", "already_saved", "failed"}:
@@ -220,9 +299,10 @@ class StickerService:
         try:
             if job is None:
                 if not job_id:
+                    if acquiring:
+                        self.log_acquisition(row, "missing_receipt")
                     return result(action, state)
                 job = await self.adapter.client.job(job_id)
-            acquiring = action.startswith("acquire:")
             expected_kind = (
                 "sticker_acquire"
                 if acquiring
@@ -265,9 +345,13 @@ class StickerService:
                     "rejected",
                 }:
                     state = "failed"
-        except (NativeAPIError, ToolError, TypeError, AttributeError):
+        except (NativeAPIError, ToolError, TypeError, AttributeError) as error:
+            if acquiring and isinstance(error, NativeAPIError):
+                self.log_acquisition(row, "job_read", error=error)
             state = "needs_review"
         self.adapter.state.finish_sticker(key, state, job_id, server_id)
+        if acquiring and state in {"needs_review", "failed"}:
+            self.log_acquisition(row, "job_result", job)
         return result(action, state)
 
     async def transfer(self, raw, asset):
@@ -581,8 +665,10 @@ class StickerService:
         try:
             async with asyncio.timeout(self.adapter.client.media_timeout):
                 if won:
-                    job = await self.adapter.client.download_sticker(
-                        source["packId"], source["stickerId"], key
+                    # Plugin reloads may retain a client created before this API wrapper.
+                    # Run the current wrapper on the same authenticated transport/session.
+                    job = await NativeClient.download_sticker(
+                        self.adapter.client, source["packId"], source["stickerId"], key
                     )
                     outcome = await self.inspect(row, job)
                 else:
@@ -601,6 +687,13 @@ class StickerService:
                         else "sticker_acquisition_needs_review",
                     )
         except BaseException as error:
+            if not isinstance(error, ToolError):
+                retained = self.adapter.state.sticker_operation(
+                    row["account"], row["thread"], row["trigger_message_id"], row["action"]
+                )
+                self.log_acquisition(
+                    retained, "wait" if retained["job_id"] else "submit", error=error
+                )
             state = (
                 "failed"
                 if isinstance(error, NativeAPIError)
