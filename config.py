@@ -55,7 +55,7 @@ CONFIG_METADATA = {
     "enable_stickers": {
         "type": "bool",
         "description": "启用原生表情读取、收藏与发送",
-        "hint": "需要 Native v2.4.0；读取复用媒体开关，收藏仅限管理员明确请求。",
+        "hint": "Native v2.4.0；群聊引用自动去重收藏，无需管理员或 @；视觉识别使用媒体开关。",
     },
     "enable_wechat_actions": {
         "type": "bool",
@@ -67,10 +67,10 @@ CONFIG_METADATA = {
     },
     "wechat_action_admins": {
         "type": "list",
-        "description": "群改名、撤回与表情收藏管理员 senderId 白名单",
+        "description": "群改名与撤回管理员 senderId 白名单",
         "hint": (
             "填写管理员真实 senderId，例如 wxid_admin，不是昵称或 Native Account ID；"
-            "空列表不允许任何人改群名、撤回消息或收藏表情。修改机器人自己的群昵称不受此管理员名单限制，"
+            "空列表不允许任何人改群名或撤回消息。修改机器人自己的群昵称不受此管理员名单限制，"
             "但仍须符合群聊交互规则。"
         ),
     },

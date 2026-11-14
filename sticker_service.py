@@ -7,6 +7,8 @@ import re
 import time
 import uuid
 
+from astrbot.api import logger
+
 from .native_client import MediaError, NativeAPIError, SendError
 from .tool_support import ToolError, context, result
 
@@ -33,27 +35,62 @@ def quoted_sticker(raw):
     )
 
 
-def explicit_save_request(text):
-    """Require an imperative about this quote, not a mention of the feature."""
-    if not isinstance(text, str) or re.search(r"不要|不想|别|不许|do\s+not|don't", text, re.I):
-        return False
-    text = re.sub(r"^(?:@[^\u2005\r\n]+\u2005[ \t]*)+", "", text)
-    pattern = (
-        r"(?:(?:请|帮我|替我|给我|麻烦你?)\s*)*"
-        r"(?:(?:把|将)(?:这个|这张|该|引用的)?表情(?:包)?)?"
-        r"(?:收藏|保存)(?:(?:这个|这张|该|引用的)?表情(?:包)?|这个)?"
-        r"(?:一下|起来|到(?:微信)?收藏(?:里|中)?|吧|谢谢)*"
-    )
-    return any(
-        re.fullmatch(pattern, clause.strip())
-        or re.fullmatch(r"(?:please\s+)?save\s+(?:this|the quoted)\s+sticker", clause.strip(), re.I)
-        for clause in re.split(r"[，,。.!！\n]", text)
-    )
-
-
 class StickerService:
     def __init__(self, adapter):
         self.adapter = adapter
+
+    def auto_save_eligible(self, raw, origin="live"):
+        cfg = self.adapter.native_config
+        thread = raw.get("threadId", "")
+        return (
+            cfg.enable_stickers
+            and cfg.group_reply_mode != "disabled"
+            and origin == "live"
+            and raw.get("accountId") == cfg.account_id
+            and thread.endswith("@chatroom")
+            and (not cfg.allowed_groups or thread in cfg.allowed_groups)
+            and raw.get("direction") == "incoming"
+            and isinstance(raw.get("senderId"), str)
+            and bool(raw["senderId"])
+            and raw["senderId"] != self.adapter.bot_self_id
+            and raw.get("recall") is None
+            and quoted_sticker(raw)
+            and self.adapter._check_timestamp(raw)
+        )
+
+    async def auto_save(self, raw):
+        """Silently save a validated live group quote, independently of model wake-up."""
+        adapter = self.adapter
+
+        def authorize():
+            if (
+                adapter.stopped
+                or adapter._state_closed
+                or adapter.client.closed
+                or not self.auto_save_eligible(raw)
+                or adapter.loop_guard.blocked(raw["threadId"])
+                or adapter.state.message_status(raw["id"]) not in {"queued", "replied", "no_reply"}
+                or not adapter.state.message_matches(
+                    raw["id"], raw["threadId"], raw.get("serverId")
+                )
+                or adapter.state.is_recalled(raw["threadId"], raw["quote"].get("serverId"))
+            ):
+                raise ToolError("not_available", "automatic_sticker_source_invalidated")
+
+        try:
+            async with adapter._media_semaphore:
+                outcome = await self._save_quote(raw, authorize)
+            logger.info(
+                "WeChat Native 引用表情自动收藏：message=%s status=%s",
+                raw["id"],
+                outcome["status"],
+            )
+        except Exception as error:
+            logger.warning(
+                "WeChat Native 引用表情自动收藏未完成：message=%s error_type=%s",
+                raw["id"],
+                type(error).__name__,
+            )
 
     async def check_quote(self, raw):
         adapter = self.adapter
@@ -236,21 +273,14 @@ class StickerService:
             raise
 
     async def save(self, event):
-        def authorize():
-            ctx = context(event, stickers=True)
-            if (
-                ctx.sender not in self.adapter.native_config.wechat_action_admins
-                or not explicit_save_request(event.message_obj.raw_message.get("body", ""))
-            ):
-                raise ToolError("permission_denied")
-            if not self.adapter.native_config.enable_media:
-                raise ToolError("not_available")
-            return ctx
+        return await self._save_quote(
+            event.message_obj.raw_message, lambda: context(event, stickers=True)
+        )
 
-        ctx = authorize()
-        raw = event.message_obj.raw_message
+    async def _save_quote(self, raw, authorize):
+        authorize()
         existing = self.adapter.state.sticker_operation(
-            ctx.account, ctx.thread, ctx.message_id, "save"
+            raw["accountId"], raw["threadId"], raw["id"], "save"
         )
         if existing:
             return await self.inspect(existing)

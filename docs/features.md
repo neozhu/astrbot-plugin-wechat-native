@@ -58,7 +58,10 @@ URL 图片仅允许公网 HTTP(S) 和 80/443 端口，不携带 Native Token、C
 
 在机器人参数中开启 `enable_stickers: true`，其默认值为 `false`。
 沿用 `token_file` 中目标账号的 `read + media + send` 权限，不需要独立 Token 或服务。
-收藏管理员沿用 `wechat_action_admins`，与 `enable_wechat_actions`、管理 Token 无关。
+收藏不需要管理员，不使用 `wechat_action_admins` 或独立管理 Token。
+在允许的群聊中，任何成员引用有效 Sticker 都会静默自动去重收藏，不需要 @或明确要求。
+不依赖模型工具调用或 `enable_media`，不会因此主动回复；关闭群聊、白名单和循环保护仍生效。
+私聊不会自动收藏，任何允许交互的用户均可通过收藏工具保存当前引用。
 
 引用微信普通表情或分享表情提问；群聊需要真正 @机器人，并遵守群白名单。
 引用读取还需要 `enable_media: true` 和 AstrBot 当前视觉模型。
@@ -67,7 +70,7 @@ URL 图片仅允许公网 HTTP(S) 和 80/443 端口，不携带 Native Token、C
 
 | 工具 | 用法 |
 | --- | --- |
-| `wechat_save_quoted_sticker()` | 管理员引用表情并明确说“请收藏这个表情”；不接受外部消息、资产或账号 ID |
+| `wechat_save_quoted_sticker()` | 保存当前引用，所有允许交互的用户均可使用；群聊已自动处理；不接受外部消息、资产或账号 ID |
 | `wechat_find_stickers(query="", limit=12)` | 从 Saved 与已添加官方包的官方 caption/包名查找，最多返回12个当前事件候选，不下载、不发送 |
 | `wechat_send_sticker(selection_id)` | 在当前聊天发送当前事件候选，可用于正常聊天语境；重新检查当前成员关系 |
 
@@ -87,7 +90,12 @@ Native v2.4.0 没有收藏/媒体下载的按键查询接口；如果连首次 J
 将持续阻塞并等待人工核对，禁止删除状态库或换键盲目重试。
 
 候选保留5分钟，每个事件最多保留最近120个，单次查找最多读取前50个已添加官方包。
-仅按官方文字子串查找，没有描述的 Saved 不能猜测含义；不做视觉打标、语义搜索或自动收藏。
+仅按官方文字子串查找，没有描述的 Saved 不能猜测含义；不做视觉打标或语义搜索。
+
+输入框里的微笑、捂脸、旺柴等小黄脸是文字表情，Native 保留 `[微笑]`、`[捂脸]` 等别名。
+引用时按文字交付 AstrBot，不走视觉图片或 Sticker 收藏流程。
+这与官方整套动态表情、自定义 Sticker 的图片资源不同；详见
+[Native 文字表情说明](https://github.com/thisnick/agent-wechat/blob/v2.4.0/docs/src/content/docs/how-it-works/message-types.mdx#text-emoji)。
 升级流程、自动测试及待执行的手机验收见[验收与升级记录](verification-stickers-v2.4.0.md)。
 
 ## 微信语音收发

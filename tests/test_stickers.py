@@ -208,7 +208,7 @@ async def test_invalid_quote_never_enters_visual_chain(serve, tmp_path, change):
 async def save_event(serve, tmp_path, **options):
     raw = quoted()
     raw["body"] = "请收藏这个表情"
-    native, adapter = await setup(serve, tmp_path, raw, wechat_action_admins=["user"], **options)
+    native, adapter = await setup(serve, tmp_path, raw, **options)
     return native, adapter, await deliver(adapter, raw)
 
 
@@ -300,17 +300,11 @@ async def test_concurrent_save_and_lost_admission_never_resubmit_after_restart(s
         await adapter.terminate()
 
 
-@pytest.mark.parametrize("change", ["admin", "intent", "original", "wxgf", "scope"])
-async def test_save_denies_unauthorized_or_unverified_source(serve, tmp_path, change):
+@pytest.mark.parametrize("change", ["original", "wxgf", "scope"])
+async def test_save_denies_unverified_source(serve, tmp_path, change):
     native, adapter, event = await save_event(serve, tmp_path)
     try:
-        if change == "admin":
-            from dataclasses import replace
-
-            adapter.native_config = replace(adapter.native_config, wechat_action_admins=frozenset())
-        elif change == "intent":
-            native.raw["body"] = event.message_obj.raw_message["body"] = "这个表情怎么样"
-        elif change == "original":
+        if change == "original":
             native.asset.update(variant="thumbnail", actualVariant="thumbnail")
         elif change == "wxgf":
             native.asset["contentType"] = "image/x-wxgf"
@@ -519,7 +513,7 @@ async def test_asset_mutation_or_source_recall_during_content_read_is_rejected(s
         await adapter.terminate()
 
 
-@pytest.mark.parametrize("disable", ["feature", "media", "mention", "whitelist", "loop"])
+@pytest.mark.parametrize("disable", ["feature", "media", "whitelist", "loop"])
 async def test_sticker_switches_and_existing_access_policy(serve, tmp_path, disable):
     from dataclasses import replace
 
@@ -652,15 +646,13 @@ async def test_save_reconciled_noop_is_success_and_bad_job_identity_stays_blocke
         await adapter.terminate()
 
 
-@pytest.mark.parametrize(
-    "body", ["收藏功能怎么用", "这个表情值得收藏", "你收藏过这个吗", "不要收藏这个表情"]
-)
-async def test_descriptive_or_negative_save_text_is_not_authorization(serve, tmp_path, body):
+@pytest.mark.parametrize("body", ["请收藏这个表情", "这个表情怎么样", "哈哈"])
+async def test_save_does_not_depend_on_request_wording(serve, tmp_path, body):
     native, adapter, event = await save_event(serve, tmp_path)
     native.raw["body"] = event.message_obj.raw_message["body"] = body
     try:
-        assert (await save(event))["status"] == "permission_denied"
-        assert not any(c[0] == "POST" for c in native.calls)
+        assert (await save(event))["status"] == "success"
+        assert len([c for c in native.calls if c[0] == "POST"]) == 1
     finally:
         await adapter.terminate()
 
@@ -706,7 +698,7 @@ async def test_delayed_send_acceptance_still_counts_toward_loop_limit(serve, tmp
         await adapter.terminate()
 
 
-@pytest.mark.parametrize("policy", ["admin", "media", "feature"])
+@pytest.mark.parametrize("policy", ["feature"])
 async def test_save_rechecks_permission_after_last_catalog_await(serve, tmp_path, policy):
     from dataclasses import replace
 
@@ -715,11 +707,7 @@ async def test_save_rechecks_permission_after_last_catalog_await(serve, tmp_path
 
     async def revoked():
         data = await catalog()
-        change = (
-            {"wechat_action_admins": frozenset()}
-            if policy == "admin"
-            else {"enable_media" if policy == "media" else "enable_stickers": False}
-        )
+        change = {"enable_stickers": False}
         adapter.native_config = replace(adapter.native_config, **change)
         return data
 
@@ -765,5 +753,199 @@ async def test_failed_save_without_remote_rejection_evidence_keeps_content_block
         native.asset["messageId"] = "m2"
         assert (await save(await deliver(adapter, native.raw)))["status"] == "needs_review"
         assert len([c for c in native.calls if c[0] == "POST"]) == 1
+    finally:
+        await adapter.terminate()
+
+
+async def test_save_tool_accepts_any_user_without_media_preview(serve, tmp_path):
+    native, adapter, event = await save_event(serve, tmp_path, enable_media=False)
+    try:
+        assert not adapter.native_config.wechat_action_admins
+        assert (await save(event))["status"] == "success"
+        assert len([c for c in native.calls if c[0] == "POST"]) == 1
+    finally:
+        await adapter.terminate()
+
+
+def group_quote():
+    raw = quoted()
+    raw.update(threadId="room@chatroom", body="哈哈，这个很有意思")
+    return raw
+
+
+async def process_quote(adapter, raw, *, origin="live"):
+    await adapter.process_native_event(
+        native_event(raw, str(int(adapter.state.cursor) + 1), origin)
+    )
+    if adapter._media_tasks:
+        await asyncio.gather(*list(adapter._media_tasks))
+
+
+@pytest.mark.parametrize("media", [True, False])
+async def test_group_quote_auto_saves_for_any_member_without_mention_or_model(
+    serve, tmp_path, media
+):
+    native, adapter = await setup(serve, tmp_path, group_quote(), enable_media=media)
+    try:
+        assert not adapter.native_config.wechat_action_admins
+        await process_quote(adapter, native.raw)
+        assert adapter._event_queue.empty()
+        posts = [c for c in native.calls if c[0] == "POST"]
+        assert len(posts) == 1
+        assert posts[0][1].endswith("/custom-stickers")
+        assert posts[0][2] == {
+            "source": {"kind": "message", "messageId": "m1", "assetId": "sticker-original"}
+        }
+        row = adapter.state.sticker_operation("a", "room@chatroom", "m1", "save")
+        assert row["state"] == "success" and row["content_id"] == CONTENT_ID
+        assert row["idempotency_key"] == posts[0][3]
+        assert adapter.state.message_status("m1") == "no_reply"
+    finally:
+        await adapter.terminate()
+
+
+async def test_group_auto_save_skips_existing_saved_and_duplicate_events(serve, tmp_path):
+    native, adapter = await setup(serve, tmp_path, group_quote())
+    native.saved = [{"id": CONTENT_ID}]
+    try:
+        await process_quote(adapter, native.raw)
+        await process_quote(adapter, native.raw)
+        native.raw = dict(native.raw, id="m2", serverId="901", senderId="other-member")
+        native.asset["messageId"] = "m2"
+        await process_quote(adapter, native.raw)
+        assert not any(c[0] == "POST" for c in native.calls)
+        assert (
+            adapter.state.sticker_operation("a", "room@chatroom", "m2", "save")["state"]
+            == "already_saved"
+        )
+        assert adapter._event_queue.empty()
+    finally:
+        await adapter.terminate()
+
+
+async def test_unknown_automatic_save_blocks_same_content_after_restart(serve, tmp_path):
+    native, adapter = await setup(serve, tmp_path, group_quote())
+    native.post_status = 503
+    try:
+        await process_quote(adapter, native.raw)
+        row = adapter.state.sticker_operation("a", "room@chatroom", "m1", "save")
+        assert row["state"] == "needs_review"
+        cfg = dict(adapter.config)
+        await adapter.terminate()
+        adapter = module("adapter").WeChatNativeAdapter(
+            cfg, {}, asyncio.Queue(), state_dir=tmp_path
+        )
+        adapter.bot_self_id = "bot"
+        await adapter.client.open()
+        await adapter.stickers.recover()
+        native.raw = dict(native.raw, id="m2", serverId="901", senderId="other-member")
+        native.asset["messageId"] = "m2"
+        await process_quote(adapter, native.raw)
+        assert len([c for c in native.calls if c[0] == "POST"]) == 1
+        assert adapter._event_queue.empty()
+    finally:
+        await adapter.terminate()
+
+
+@pytest.mark.parametrize(
+    "blocked",
+    [
+        "disabled",
+        "group_disabled",
+        "whitelist",
+        "history",
+        "self",
+        "recalled",
+        "unsupported",
+        "private",
+    ],
+)
+async def test_group_auto_save_keeps_existing_scope_and_valid_quote_guards(
+    serve, tmp_path, blocked
+):
+    from dataclasses import replace
+
+    native, adapter = await setup(serve, tmp_path, group_quote())
+    origin = "live"
+    if blocked == "disabled":
+        adapter.native_config = replace(adapter.native_config, enable_stickers=False)
+    elif blocked == "group_disabled":
+        adapter.native_config = replace(adapter.native_config, group_reply_mode="disabled")
+    elif blocked == "whitelist":
+        adapter.native_config = replace(adapter.native_config, allowed_groups=frozenset({"other"}))
+    elif blocked == "history":
+        origin = "history"
+    elif blocked == "self":
+        native.raw["senderId"] = "bot"
+    elif blocked in {"recalled", "unsupported"}:
+        native.raw["quote"]["state"] = blocked
+    else:
+        native.raw["threadId"] = "peer"
+    try:
+        await process_quote(adapter, native.raw, origin=origin)
+        assert not any(c[0] == "POST" for c in native.calls)
+    finally:
+        await adapter.terminate()
+
+
+async def test_mentioned_group_quote_keeps_visual_handoff_and_shares_save_receipt(serve, tmp_path):
+    from astrbot.api.message_components import Image
+
+    raw = group_quote()
+    raw["mentions"]["self"] = True
+    native, adapter = await setup(serve, tmp_path, raw)
+    try:
+        await process_quote(adapter, native.raw)
+        event = adapter._event_queue.get_nowait()
+        assert any(isinstance(c, Image) for c in event.message_obj.message)
+        assert (await save(event))["status"] == "success"
+        assert len([c for c in native.calls if c[0] == "POST"]) == 1
+    finally:
+        await adapter.terminate()
+
+
+@pytest.mark.parametrize("revoke", ["feature", "whitelist", "recall"])
+async def test_group_auto_save_rechecks_scope_before_post(serve, tmp_path, revoke):
+    from dataclasses import replace
+
+    native, adapter = await setup(serve, tmp_path, group_quote())
+    catalog = adapter.client.custom_stickers
+
+    async def revoked():
+        data = await catalog()
+        if revoke == "feature":
+            adapter.native_config = replace(adapter.native_config, enable_stickers=False)
+        elif revoke == "whitelist":
+            adapter.native_config = replace(
+                adapter.native_config, allowed_groups=frozenset({"other"})
+            )
+        else:
+            adapter.state.recall("room@chatroom", native.raw["quote"]["serverId"], None)
+        return data
+
+    adapter.client.custom_stickers = revoked
+    try:
+        await process_quote(adapter, native.raw)
+        assert not any(c[0] == "POST" for c in native.calls)
+        assert adapter._event_queue.empty()
+    finally:
+        await adapter.terminate()
+
+
+@pytest.mark.parametrize("face", ["[微笑]", "[捂脸]", "[旺柴]"])
+async def test_wechat_text_faces_are_preserved_in_quote_component(serve, tmp_path, face):
+    from astrbot.api.message_components import Image, Reply
+
+    raw = quoted(type=1, embeddedText=face, embeddedSticker=False)
+    raw.update(threadId="room@chatroom")
+    raw["mentions"]["self"] = True
+    native, adapter = await setup(serve, tmp_path, raw)
+    try:
+        event = await deliver(adapter, native.raw)
+        assert any(
+            isinstance(c, Reply) and c.message_str == face for c in event.message_obj.message
+        )
+        assert not any(isinstance(c, Image) for c in event.message_obj.message)
+        assert not any(c[0] == "POST" or c[1].endswith("/media") for c in native.calls)
     finally:
         await adapter.terminate()

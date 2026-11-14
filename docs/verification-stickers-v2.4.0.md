@@ -1,6 +1,9 @@
 # 原生表情开发、验收与升级记录
 
-基于 [SPEC v1.1](SPEC-WeChat%20Native%20Sticker%20Receive%20Save%20%20Send.md)，目标插件 v0.3.15。
+基于 [SPEC](SPEC-WeChat%20Native%20Sticker%20Receive%20Save%20%20Send.md)，插件版本保持 v0.3.15。
+初版的历史验证结果保留在下方；本次按用户要求将群聊引用改为自动去重收藏，
+去掉收藏的管理员/明确请求限制，见[增量开发记录](superpowers/plans/2026-11-14-sticker-auto-save.md)。
+本次全量回归 **888 passed**，71个 Sticker 专项场景通过；真实微信读取与自动收藏仍待验收。
 修改前工作区干净，`main` 为 `2188fc7`；与 `origin/main` (`95b132f`) 的差异只有 SPEC 文档。
 已在修改前阅读六个指定实现文件，并核对 Native v2.4.0 的官方 OpenAPI 和服务端实现。
 
@@ -35,7 +38,7 @@
 | B3 不同引用同内容 | 同上，m1/m2 指向相同实际字节身份 |
 | B4 并发同内容 | `test_sqlite_claim_serializes_same_content_across_connections`，两个独立 SQLite 连接 |
 | B5 重复/超时/重启 | `test_concurrent_save_and_lost_admission_never_resubmit_after_restart`、`test_receipts_recover_after_restart_using_reads_only` |
-| B6 管理员/原图/WXGF | 来源拒绝、明确请求识别、最终权限重查测试 |
+| B6 普通用户/原图/WXGF | `test_save_tool_accepts_any_user_without_media_preview`、`test_save_denies_unverified_source`、自动收藏作用域重查测试 |
 | C1 Saved 查询 | `test_catalog_is_bounded_metadata_only_and_selection_is_event_bound` |
 | C2 已添加官方包 | 同上；`test_membership_removed_after_find_prevents_post[pack]` |
 | C3 saved 来源原生发送 | `test_native_send_reuses_outbox_and_sends_one_selected_original[saved]` |
@@ -43,13 +46,13 @@
 | C5 严格成功回执 | `test_unconfirmed_send_never_reports_success_or_submits_twice` 六种故障；原子回执测试 |
 | C6 重复工具/断线/未知结果 | 同上；并发发送、重启恢复、延迟确认循环保护测试 |
 | D1 默认关闭兼容 | `test_sticker_switches_and_existing_access_policy`、工具默认关闭零 HTTP 测试 |
-| D2 @/白名单/循环/管理员 | 同上；管理员请求与撤权测试、群限流/撤回测试、原有 loop/mention 测试 |
+| D2 @/白名单/循环/普通成员 | 自动收藏无需 @/管理员，视觉问答仍需 @；群限流/撤回、原有 loop/mention 测试 |
 | D3 既有功能回归 | 全量 pytest，保留原有文本、图片、语音、PDF、引用、撤回与连接测试 |
 
 TDD 每阶段的失败、实现和通过记录见[实施计划证据表](superpowers/plans/2026-11-14-stickers.md)。
 原始运行日志位于工作区 `.scratch/stickers/`（不纳入发布包）。
 
-## 最终自动化结果
+## v0.3.15 初版自动化结果（历史）
 
 验证环境使用仓库现有 `.venv/Scripts/python.exe`（Python 3.12），以及固定的 ruff 0.15.7。
 
@@ -79,7 +82,7 @@ TDD 每阶段的失败、实现和通过记录见[实施计划证据表](superpo
 本次没有连接已登录的真实微信账号或使用手机检查，不能将 HTTP 模拟测试记为实机成功。
 
 - [ ] 引用群友动态表情并真正 @机器人，确认当前视觉模型能读取预览。
-- [ ] 首次收藏后，在手机微信 Saved 中确认出现。
+- [ ] 任意群成员不 @引用真实 Sticker，确认自动出现在机器人手机微信 Saved 中。
 - [ ] 再次收藏相同字节内容，返回已收藏且手机没有重复项。
 - [ ] 从个人 Saved 发送，在接收手机确认显示为原生表情。
 - [ ] 从已添加官方包发送，包含缺少本地原图时的单项按需获取。
@@ -90,9 +93,10 @@ TDD 每阶段的失败、实现和通过记录见[实施计划证据表](superpo
 1. 停止 AstrBot 机器人，备份原插件数据目录（含 SQLite、WAL/SHM）和 Native 数据。
    保留原 `server_url`、`account_id` 与机器人 ID，避免切换到另一份空状态库。
 2. 将 Native 镜像升级为 `ghcr.io/thisnick/agent-wechat-native:v2.4.0`，确认账号在线。
-3. 更新插件至 v0.3.15 并安装 `requirements.txt`，Python 3.12+、AstrBot 版本范围不变。
+3. 更新插件的 `main` 分支代码并重启机器人；测试期间版本号保持 v0.3.15。
+   已部署 v0.3.15 的依赖不变，Python 3.12+、AstrBot 版本范围不变。
 4. 沿用 `token_file` 的目标账号 `read + media + send` scopes；无需额外 Admin Token。
-   需要收藏时，将管理员真实 senderId 加入已有 `wechat_action_admins`。
+   收藏不需要配置 `wechat_action_admins`；该名单继续控制原有群改名和撤回工具。
 5. 启动时自动追加轻量级操作表和索引；不删除旧表，不重新投递旧消息。先保持默认关闭，
    再显式开启 `enable_stickers`。引用读取还需 `enable_media` 和支持视觉的模型。
 6. 执行上述六项手机验收后再推广。回滚插件时仍保留完整状态库和 Native 数据，
@@ -107,8 +111,8 @@ TDD 每阶段的失败、实现和通过记录见[实施计划证据表](superpo
 - GIF 只交付代表静态帧；不做完整动画理解。视觉预览最大1600万像素，沿用10 MiB媒体限制。
 - 按官方 caption/包名子串查找；无描述的 Saved 不猜含义。最多读取前50个已添加官方包，
   返回1–12个候选；每个事件保留最近120个候选，5分钟后失效。
-- 明确收藏使用保守的常用请求句式校验，例如“请收藏这个表情”“把这个表情收藏一下”；
-  描述、疑问或否定句不会授权写入，复杂措辞可改用上述明确句式。
+- 开启 `enable_stickers` 后，允许群聊的有效引用静默自动收藏，不受 @、管理员或媒体视觉开关限制。
+  直接发送的 Sticker 和私聊引用不自动收藏；微信小黄脸文字别名不作为 Sticker 图片收藏。
 - 本地审计不是永久 Saved 事实。新触发请求重新读取 Native 目录；同一触发消息只查看原结果。
 - 未知回执持续阻塞是有意行为。独立副本/状态库之间不共享 SQLite 唯一约束，
   部署时不要用多个独立机器人副本并发处理同一账号的同一事件流。

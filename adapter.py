@@ -994,6 +994,7 @@ class WeChatNativeAdapter(Platform):
                 await self._reply_to_red_packet(raw)
             return
         eligible = kind != "ignore"
+        auto_save = self.stickers.auto_save_eligible(raw, origin)
         cacheable = self.native_config.enable_group_summary and self._eligible(
             raw, origin, summary=True
         )
@@ -1007,11 +1008,15 @@ class WeChatNativeAdapter(Platform):
             message_id,
             thread,
             raw.get("serverId"),
-            "queued" if eligible else "ignored",
+            "queued" if eligible else "no_reply" if auto_save else "ignored",
             received=received,
         )
         recent_kind, recent_source = None, None
         if fresh:
+            if auto_save:
+                task = asyncio.create_task(self.stickers.auto_save(raw))
+                self._media_tasks.add(task)
+                task.add_done_callback(self._media_tasks.discard)
             self._remember_group_image(raw, origin)
             if kind == "text":
                 recent_kind, recent_source = self._recent_media_request(raw, converted.message_str)
