@@ -1381,3 +1381,47 @@ def test_pack_acquisition_claim_deduplicates_unknown_item_across_connections(tmp
     finally:
         first.close()
         second.close()
+
+
+async def test_send_accepts_nested_result_server_message_id(serve, tmp_path):
+    native, adapter, event = await send_event(serve, tmp_path)
+    base_job = native.job
+
+    def v241_job(kind="sticker_saved", job_id="job1"):
+        value = base_job(kind, job_id)
+        if kind == "sticker_send":
+            value["serverMessageId"] = None
+            value["result"]["serverMessageId"] = "999"
+        return value
+
+    native.job = v241_job
+    try:
+        selection = (await find(event))["items"][0]["selection_id"]
+        result = await send_sticker(event, selection)
+        assert result["status"] == "success"
+        op = adapter.state.sticker_operation("a", "peer", event.message_obj.message_id, "send")
+        assert op["server_message_id"] == "999"
+        record = adapter.state.send_record(op["idempotency_key"])
+        assert record["state"] == "accepted"
+    finally:
+        await adapter.terminate()
+
+
+async def test_send_rejects_mismatched_top_and_nested_server_message_id(serve, tmp_path):
+    native, adapter, event = await send_event(serve, tmp_path)
+    base_job = native.job
+
+    def mismatched_job(kind="sticker_saved", job_id="job1"):
+        value = base_job(kind, job_id)
+        if kind == "sticker_send":
+            value["serverMessageId"] = "999"
+            value["result"]["serverMessageId"] = "888"
+        return value
+
+    native.job = mismatched_job
+    try:
+        selection = (await find(event))["items"][0]["selection_id"]
+        result = await send_sticker(event, selection)
+        assert result["status"] == "needs_review"
+    finally:
+        await adapter.terminate()
