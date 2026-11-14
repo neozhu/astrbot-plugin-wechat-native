@@ -909,12 +909,17 @@ class StickerService:
         return result("send", "success")
 
     async def send(self, event, selection_id):
+        def finish_outcome(outcome):
+            if outcome.get("status") in {"success", "pending", "submitting", "needs_review"}:
+                event.set_extra("wechat_native_sticker_suppress_followup", True)
+            return outcome
+
         ctx = context(event, stickers=True, sticker_recovery=True)
         existing = self.adapter.state.sticker_operation(
             ctx.account, ctx.thread, ctx.message_id, "send"
         )
         if existing:
-            return await self.inspect_send(existing)
+            return finish_outcome(await self.inspect_send(existing))
         selections = event.get_extra("wechat_native_sticker_selections") or {}
         selection = selections.get(selection_id) if isinstance(selection_id, str) else None
         if (
@@ -932,7 +937,7 @@ class StickerService:
         if row is None:
             raise ToolError("rate_limited")
         if not won:
-            return await self.inspect_send(row)
+            return finish_outcome(await self.inspect_send(row))
         key = row["idempotency_key"]
         try:
             sent = await self.adapter.send_chain(
@@ -965,7 +970,11 @@ class StickerService:
                     "reason": error.code,
                     "message": "Native 已明确拒绝这次表情发送，未发送成功。",
                 }
-            return result("send", state, **fields)
-        return await self.inspect_send(
-            self.adapter.state.sticker_operation(ctx.account, ctx.thread, ctx.message_id, "send")
+            return finish_outcome(result("send", state, **fields))
+        return finish_outcome(
+            await self.inspect_send(
+                self.adapter.state.sticker_operation(
+                    ctx.account, ctx.thread, ctx.message_id, "send"
+                )
+            )
         )

@@ -232,6 +232,20 @@ class WeChatNativeEvent(AstrMessageEvent):
         super().__init__(message.message_str, message, adapter.meta(), message.session_id)
         self.adapter = adapter
 
+    def _sticker_send_state(self) -> str | None:
+        raw = (
+            self.message_obj.raw_message if isinstance(self.message_obj.raw_message, dict) else None
+        )
+        if not raw or not isinstance(raw.get("threadId"), str) or self.adapter._state_closed:
+            return None
+        sticker = self.adapter.state.sticker_operation(
+            self.adapter.native_config.account_id,
+            raw["threadId"],
+            self.message_obj.message_id,
+            "send",
+        )
+        return sticker["state"] if sticker else None
+
     async def send(self, message: MessageChain) -> None:
         if self.adapter.stopped:
             raise RuntimeError("WeChat Native 已停止")
@@ -251,20 +265,12 @@ class WeChatNativeEvent(AstrMessageEvent):
         if status == "recalled":
             self.stop_event()
             return
+        if self.get_extra(
+            "wechat_native_sticker_suppress_followup"
+        ) or self._sticker_send_state() in {"success", "submitting", "pending", "needs_review"}:
+            self.stop_event()
+            return
         if status in {"needs_review", "failed", "partial"}:
-            sticker = (
-                self.adapter.state.sticker_operation(
-                    self.adapter.native_config.account_id,
-                    raw["threadId"],
-                    self.message_obj.message_id,
-                    "send",
-                )
-                if raw and isinstance(raw.get("threadId"), str)
-                else None
-            )
-            if sticker and sticker["state"] in {"submitting", "pending", "needs_review"}:
-                self.stop_event()
-                return
             raise RuntimeError("此消息的回复需人工检查，禁止自动重发")
         try:
             sent = await self.adapter.send_chain(

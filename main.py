@@ -107,7 +107,8 @@ class WeChatNativePlugin(Star):
         """把当前事件查到的一个本地就绪候选发送为原生微信表情，可用于正常聊天语境。
 
         每条触发消息最多一个表情；同群至少间隔30秒。success 才表示微信接受。
-        pending/needs_review 不代表成功，禁止重试或换候选重新发送。不能指定其他聊天。
+        发送成功（success）或处于 pending/needs_review 后，插件会结束当前后续文本/语音回复，
+        不再追加消息。pending/needs_review 不代表成功，禁止重试或换候选重新发送。不能指定其他聊天。
         selection_id 只对产生它的当前用户消息有效，不得直接使用上一轮对话里的 ID。
         即使用户说“发送你刚找到的”，也先在当前消息重新调用 wechat_find_stickers，
         再发送新候选。sticker_selection_expired 表示尚未提交，可按此流程重新查找并发送；
@@ -322,6 +323,19 @@ class WeChatNativePlugin(Star):
         req.extra_user_content_parts.append(
             TextPart(text=pdf_context_text(str(pdf.get("name") or "未命名.pdf"), pdf["text"]))
         )
+
+    @filter.on_decorating_result()
+    async def suppress_post_sticker_reply(self, event: AstrMessageEvent):
+        """Skip TTS and follow-up text/voice replies once a sticker was sent or is unconfirmed."""
+        if not isinstance(event, WeChatNativeEvent):
+            return
+        if event.get_extra(
+            "wechat_native_sticker_suppress_followup"
+        ) or event._sticker_send_state() in {"success", "submitting", "pending", "needs_review"}:
+            result = event.get_result()
+            if result is not None and result.chain is not None:
+                result.chain.clear()
+            event.stop_event()
 
     @filter.command("读取附件")
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)

@@ -1425,3 +1425,37 @@ async def test_send_rejects_mismatched_top_and_nested_server_message_id(serve, t
         assert result["status"] == "needs_review"
     finally:
         await adapter.terminate()
+
+
+@pytest.mark.parametrize("outcome", ["success", "needs_review", "failed"])
+async def test_post_sticker_send_followup_and_tts_suppression(serve, tmp_path, outcome):
+    from astrbot.api.event import MessageChain
+    from astrbot.api.message_components import Plain
+    from astrbot.core.message.message_event_result import MessageEventResult
+
+    native, adapter, event = await send_event(serve, tmp_path)
+    if outcome == "needs_review":
+        native.job_state = "needs_review"
+    elif outcome == "failed":
+        native.post_status = 422
+        native.post_error_code = "sticker_source_unavailable"
+    plugin = object.__new__(module("main").WeChatNativePlugin)
+    try:
+        selection = (await find(event))["items"][0]["selection_id"]
+        result = await send_sticker(event, selection)
+        assert result["status"] == outcome
+        event.set_result(MessageEventResult().message("后续文本回复"))
+        await plugin.suppress_post_sticker_reply(event)
+        if outcome in {"success", "needs_review"}:
+            assert event.is_stopped()
+            assert event.get_result().chain == []
+            await event.send(MessageChain([Plain("不应该再发的后续消息")]))
+            expected_posts = 1
+            assert len([c for c in native.calls if c[0] == "POST"]) == expected_posts
+        else:
+            assert not event.is_stopped()
+            assert len(event.get_result().chain) == 1
+            await event.send(MessageChain([Plain("发送失败说明")]))
+            assert len([c for c in native.calls if c[0] == "POST" and "text" in c[2]]) == 1
+    finally:
+        await adapter.terminate()
