@@ -29,6 +29,24 @@ runtime-diagnostics-full.txt（896 passed）。
 “引用表情诊断”“表情目录诊断”和两个工具 JSON 结果，以继续定位 Native 资源/目录问题。
 原始实机故障尚未确认恢复，不能把上述自动测试当作微信端验收通过。
 
+11:07 复测仍返回不含 catalog 的旧 find 结果，故重新验证“插件更新后工具会使用新服务”这一前提。
+本地用已保留的旧 StickerService 对象复现了相同旧格式；工具入口原先直接调用 adapter.stickers，
+没有更新其类代际。现改为在可信工具入口替换旧实例，继续使用同一 Native 客户端、事件候选和 SQLite。
+此修复不依赖用户反复重启来替换表情服务，不重新提交未知操作。
+retained-service-red.txt：2 failed；retained-service-green.txt：90 passed（含原专项）；
+retained-service-full.txt：全量 **898 passed**，68.41秒；静态、格式、编译和差异检查通过。
+仍需实机确认新版 catalog/引用诊断出现后，再判断实际 Native 资源与目录是否可用。
+
+11:14 实机目录查询已返回 saved_count=1、added_pack_count=0、candidate_count=1，
+证明手动新增的 Saved 能被 Native 目录和插件读取。用户下一条消息请求发送时，模型复用了
+上一条消息的 selection_id，因此被当前事件作用域校验拦截，尚未提交 Native 发送。
+现提供 sticker_selection_expired 与 next_action=wechat_find_stickers，指导在当前请求查找新候选再发送；
+工具说明要求明确发送请求直接串联 find→send，不因候选缺少 caption 额外确认。
+已有发送意图优先只读核对，未知结果即使收到其他 ID 也不会引导重新发送。
+stale-selection-red.txt：2 failed；stale-selection-green.txt：111 passed（含相关回归）。
+stale-selection-full.txt：全量 **900 passed**，67.56秒；静态、格式、编译和差异检查通过。
+真实微信发送成功仍待本次改动后的手机验收。
+
 修改前工作区干净，`main` 为 `2188fc7`；与 `origin/main` (`95b132f`) 的差异只有 SPEC 文档。
 已在修改前阅读六个指定实现文件，并核对 Native v2.4.0 的官方 OpenAPI 和服务端实现。
 

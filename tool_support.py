@@ -36,6 +36,10 @@ STICKER_ERROR_MESSAGES = {
     "sticker_original_unsupported_format": "引用表情的原图格式暂不支持收藏，未提交收藏。",
     "sticker_original_missing_scope": "读取引用表情的权限不足，请检查 Native 的媒体权限。",
     "sticker_original_too_large": "引用表情的原图超过处理限制，未提交收藏。",
+    "sticker_selection_expired": (
+        "表情候选来自之前的消息或已过期，尚未提交发送。"
+        "请在当前请求中重新查找候选，再发送新的 selection_id。"
+    ),
 }
 
 
@@ -117,8 +121,11 @@ def error_result(action, error):
         # No exception repr/trace: upstream errors can embed secrets or chat text.
         logger.warning("WeChat Native 工具失败：action=%s type=%s", action, type(error).__name__)
         status = "failed"
-    if action == "save" and reason in STICKER_ERROR_MESSAGES:
-        return result(action, status, reason=reason, message=STICKER_ERROR_MESSAGES[reason])
+    if action in {"save", "send"} and reason in STICKER_ERROR_MESSAGES:
+        output = result(action, status, reason=reason, message=STICKER_ERROR_MESSAGES[reason])
+        if reason == "sticker_selection_expired":
+            output["next_action"] = "wechat_find_stickers"
+        return output
     return result(action, status)
 
 

@@ -537,6 +537,11 @@ class StickerService:
 
     async def send(self, event, selection_id):
         ctx = context(event, stickers=True, sticker_recovery=True)
+        existing = self.adapter.state.sticker_operation(
+            ctx.account, ctx.thread, ctx.message_id, "send"
+        )
+        if existing:
+            return await self.inspect_send(existing)
         selections = event.get_extra("wechat_native_sticker_selections") or {}
         selection = selections.get(selection_id) if isinstance(selection_id, str) else None
         if (
@@ -545,12 +550,7 @@ class StickerService:
             != (ctx.account, ctx.thread, ctx.message_id)
             or time.time() - selection["created"] > 300
         ):
-            raise ToolError("invalid_request")
-        existing = self.adapter.state.sticker_operation(
-            ctx.account, ctx.thread, ctx.message_id, "send"
-        )
-        if existing:
-            return await self.inspect_send(existing)
+            raise ToolError("invalid_request", "sticker_selection_expired")
         source = selection["source"]
         await self.validate_selection(source)
         context(event, stickers=True)

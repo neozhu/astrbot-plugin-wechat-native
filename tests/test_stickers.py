@@ -1025,3 +1025,38 @@ async def test_save_handles_missing_quote_object_as_unavailable(serve, tmp_path)
         assert not any(c[0] == "POST" for c in native.calls)
     finally:
         await adapter.terminate()
+
+
+async def test_send_after_followup_requeries_current_event_before_one_submission(serve, tmp_path):
+    native, adapter, first_event = await send_event(serve, tmp_path)
+    try:
+        old_selection = (await find(first_event))["items"][0]["selection_id"]
+        native.raw = dict(native.raw, id="m2", serverId="901", body="发送你找到的表情包")
+        event = await deliver(adapter, native.raw)
+        refused = await send_sticker(event, old_selection)
+        assert refused["status"] == "invalid_request"
+        assert refused["reason"] == "sticker_selection_expired"
+        assert refused["next_action"] == "wechat_find_stickers"
+        assert "重新查找" in refused["message"]
+        assert not any(c[0] == "POST" for c in native.calls)
+        selection = (await find(event))["items"][0]["selection_id"]
+        assert selection != old_selection
+        assert (await send_sticker(event, selection))["status"] == "success"
+        assert (await send_sticker(event, selection))["status"] == "success"
+        assert len([c for c in native.calls if c[0] == "POST"]) == 1
+    finally:
+        await adapter.terminate()
+
+
+async def test_unknown_send_is_inspected_even_when_model_reuses_another_selection(serve, tmp_path):
+    native, adapter, event = await send_event(serve, tmp_path)
+    native.post_status = 503
+    try:
+        selection = (await find(event))["items"][0]["selection_id"]
+        assert (await send_sticker(event, selection))["status"] == "needs_review"
+        repeated = await send_sticker(event, "selection-from-previous-message")
+        assert repeated["status"] == "needs_review"
+        assert "next_action" not in repeated
+        assert len([c for c in native.calls if c[0] == "POST"]) == 1
+    finally:
+        await adapter.terminate()
