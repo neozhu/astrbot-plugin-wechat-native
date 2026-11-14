@@ -309,9 +309,10 @@ class StickerService:
         if existing:
             return await self.inspect(existing)
         if not quoted_sticker(raw):
+            quote = raw.get("quote")
             reason = (
                 "sticker_original_recalled"
-                if raw.get("quote", {}).get("state") == "recalled"
+                if isinstance(quote, dict) and quote.get("state") == "recalled"
                 else "sticker_quote_unavailable"
             )
             raise ToolError("not_available", reason)

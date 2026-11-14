@@ -1011,3 +1011,17 @@ async def test_save_explains_unavailable_quote_instead_of_generic_failure(
         assert not any(c[0] == "POST" for c in native.calls)
     finally:
         await adapter.terminate()
+
+
+async def test_save_handles_missing_quote_object_as_unavailable(serve, tmp_path):
+    raw = quoted()
+    raw["quote"] = None
+    native, adapter = await setup(serve, tmp_path, raw)
+    try:
+        event = await deliver(adapter, native.raw)
+        data = await save(event)
+        assert data["status"] == "not_available"
+        assert data["reason"] == "sticker_quote_unavailable"
+        assert not any(c[0] == "POST" for c in native.calls)
+    finally:
+        await adapter.terminate()
