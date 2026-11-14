@@ -3,7 +3,7 @@
 基于 [SPEC](SPEC-WeChat%20Native%20Sticker%20Receive%20Save%20%20Send.md)，插件版本保持 v0.3.15。
 初版的历史验证结果保留在下方；本次按用户要求将群聊引用改为自动去重收藏，
 去掉收藏的管理员/明确请求限制，见[增量开发记录](superpowers/plans/2026-11-14-sticker-auto-save.md)。
-本次全量回归 **888 passed**，71个 Sticker 专项场景通过；真实微信读取与自动收藏仍待验收。
+最新全量回归 **916 passed**，95个 Sticker 专项场景通过；真实微信发送与自动收藏仍待验收。
 
 ## 2026-11-14 实机失败日志后的修复与诊断
 
@@ -63,6 +63,12 @@ Saved 可以在发送 Job 内按需获取 GIF；pack 来源缺少索引原图时
 - TDD：send-failure-red.txt（2 failed）→send-failure-green.txt（2 passed）；
   pack-acquisition-red.txt（12 failed）→pack-acquisition-green.txt（12 passed）；
   pack-acquisition-regression.txt（95 passed，含取消/只读恢复和跨连接获取去重）。
+  pack-send-full.txt：全量 **916 passed**（71.43秒），唯一 warning 为既有 audioop 弃用提示。
+  修改文件的 Ruff 检查、六个已规范格式文件的格式检查、源码编译和 git diff --check 均通过；
+  native_client.py 沿用已确认的基线格式问题，只加入本次所需代码。
+
+本轮改动文件：adapter.py、event.py、native_client.py、state.py、sticker_service.py、
+tool_support.py、tests/test_stickers.py、docs/features.md、本验收记录及原开发计划。
 
 本轮升级必须完整重启 AstrBot 进程/容器，让已有 NativeClient 加载新增的获取接口。
 版本号仍为 v0.3.15，保留原状态库；历史未知请求不重提。发送一条新测试消息：
