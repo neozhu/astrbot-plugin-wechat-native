@@ -107,8 +107,9 @@ class WeChatNativePlugin(Star):
         """把当前事件查到的一个本地就绪候选发送为原生微信表情，可用于正常聊天语境。
 
         每条触发消息最多一个表情；同群至少间隔30秒。success 才表示微信接受。
-        发送成功（success）或处于 pending/needs_review 后，插件会结束当前后续文本/语音回复，
-        不再追加消息。pending/needs_review 不代表成功，禁止重试或换候选重新发送。不能指定其他聊天。
+        pending/needs_review 不代表成功，禁止重试或换候选重新发送。不能指定其他聊天。
+        工具返回 success/pending/needs_review 后，请输出一句简短结束语（如“已发送”），
+        切勿返回空内容；插件会自动拦截外发，不会将其发送到微信或触发语音合成。
         selection_id 只对产生它的当前用户消息有效，不得直接使用上一轮对话里的 ID。
         即使用户说“发送你刚找到的”，也先在当前消息重新调用 wechat_find_stickers，
         再发送新候选。sticker_selection_expired 表示尚未提交，可按此流程重新查找并发送；
