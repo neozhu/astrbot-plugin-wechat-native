@@ -1,4 +1,3 @@
-import asyncio
 import importlib
 import json
 from pathlib import Path
@@ -230,11 +229,23 @@ async def test_replacing_retained_sticker_service_preserves_unknown_intent(serve
         await adapter.terminate()
 
 
-async def test_pack_send_uses_current_transport_with_retained_pre_upgrade_client(serve, tmp_path):
-    from test_stickers import find, send_event, send_sticker
+async def test_saved_detail_and_send_use_current_transport_with_retained_pre_upgrade_client(
+    serve, tmp_path
+):
+    from test_stickers import CONTENT_ID, find, send_event, send_sticker
 
     native, adapter, event = await send_event(serve, tmp_path)
-    native.pack_items[0]["original"] = None
+    original_request = adapter.client._request
+    detail = dict(native.saved[0])
+    native.saved[0] = {"id": CONTENT_ID, "caption": "开心", "original": None}
+
+    async def handle_detail(method, path, **kwargs):
+        if method == "GET" and path.endswith(f"/custom-stickers/{CONTENT_ID}"):
+            native.calls.append((method, path, None, None))
+            return detail
+        return await original_request(method, path, **kwargs)
+
+    adapter.client._request = handle_detail
     current = type(adapter.client)
     # Retain the actual HTTP client/session, with the class API from before the update.
     retained = type(
@@ -243,232 +254,81 @@ async def test_pack_send_uses_current_transport_with_retained_pre_upgrade_client
         {
             name: member
             for name, member in vars(current).items()
-            if name not in {"download_sticker", "__dict__", "__weakref__"}
+            if name not in {"custom_sticker", "__dict__", "__weakref__"}
         },
     )
     adapter.client.__class__ = retained
-    assert not hasattr(adapter.client, "download_sticker")
+    assert not hasattr(adapter.client, "custom_sticker")
     session = adapter.client._session
     try:
-        selection = (await find(event, "晚安"))["items"][0]["selection_id"]
+        selection = (await find(event, "开心"))["items"][0]["selection_id"]
         outcome = await send_sticker(event, selection)
         assert outcome["status"] == "success", outcome
         assert adapter.client._session is session
         posts = [c for c in native.calls if c[0] == "POST"]
-        assert [c[1].rsplit("/", 1)[1] for c in posts] == ["sticker-downloads", "sends"]
+        assert [c[1].rsplit("/", 1)[1] for c in posts] == ["sends"]
     finally:
         await adapter.terminate()
 
 
-@pytest.mark.parametrize("fault", ["http", "missing_receipt", "job_review", "foreign_job"])
-async def test_acquisition_logs_distinguish_failure_boundary_without_reposting(
+@pytest.mark.parametrize(
+    "fault", ["missing_receipt", "job_review", "foreign_job", "media_rejected"]
+)
+async def test_legacy_acquisition_recovery_logs_failure_boundary_without_reposting(
     serve, tmp_path, caplog, fault
 ):
-    from test_stickers import send_sticker
-
     native, adapter, event = await send_event(serve, tmp_path)
-    native.pack_items[0]["original"] = None
-    if fault == "http":
-        native.post_status = 503
-        native.post_error_code = "media_queue_full"
-    elif fault == "missing_receipt":
-        row, _ = adapter.stickers.claim(
-            native.raw,
-            "acquire:pack1",
-            "b" * 32,
-            {"kind": "pack", "packId": "pack1", "stickerId": "b" * 32},
-        )
-        adapter.state.finish_sticker(row["idempotency_key"], "needs_review")
-    else:
-        original = native.job
-
-        def job(kind="sticker_saved", job_id="job1"):
-            value = original(kind, job_id)
-            if kind == "sticker_acquire":
-                value.update(
-                    state="needs_review",
-                    phase="submitting",
-                    reason="sticker_submission_needs_review",
-                )
-                value["result"] = {"serverAcceptance": "pending", "private": "synthetic-secret"}
-                if fault == "foreign_job":
-                    value["accountId"] = "synthetic-secret"
-                    value["kind"] = "synthetic-secret"
-            return value
-
-        native.job = job
-    try:
-        selection = (await find(event, "晚安"))["items"][0]["selection_id"]
-        if fault == "missing_receipt":
-            # Read-only startup recovery logs missing_receipt without posting.
-            await adapter.stickers.recover()
-            assert "stage=missing_receipt" in caplog.text
-            assert not any(c[0] == "POST" for c in native.calls)
-            # An explicit send reclaims the missing-receipt row with the original key.
-            outcome = await send_sticker(event, selection)
-            assert outcome["status"] == "success"
-            posts = [c for c in native.calls if c[0] == "POST"]
-            assert [c[1].rsplit("/", 1)[1] for c in posts] == ["sticker-downloads", "sends"]
-            assert posts[0][3] == row["idempotency_key"]
-            return
-        assert (await send_sticker(event, selection))[
-            "reason"
-        ] == "sticker_acquisition_needs_review"
-        if fault == "http":
-            assert "stage=submit http=503 code=media_queue_full" in caplog.text
-        else:
-            assert "native_state=needs_review native_phase=submitting" in caplog.text
-            assert "native_code=sticker_submission_needs_review" in caplog.text
-            assert f"identity_matches={fault != 'foreign_job'}" in caplog.text
-        assert "synthetic-secret" not in caplog.text
-        posts = [c for c in native.calls if c[0] == "POST"]
-        await send_sticker(event, selection)
-        await adapter.stickers.recover()
-        assert len([c for c in native.calls if c[0] == "POST"]) == len(posts)
-        assert not any(c[1].endswith("/sends") for c in posts)
-    finally:
-        await adapter.terminate()
-
-
-async def test_pre_http_acquisition_error_marks_failed_instead_of_needs_review(serve, tmp_path):
-    from test_stickers import deliver, send_sticker
-
-    native, adapter, event = await send_event(serve, tmp_path)
-    native.pack_items[0]["original"] = None
-    try:
-        selection = (await find(event, "晚安"))["items"][0]["selection_id"]
-        original_claim = adapter.stickers.claim
-        close_once = True
-        saved_session = adapter.client._session
-
-        def claim_then_close(*args, **kwargs):
-            nonlocal close_once
-            row, won = original_claim(*args, **kwargs)
-            if close_once and args[1].startswith("acquire:"):
-                close_once = False
-                adapter.client._session = None
-            return row, won
-
-        adapter.stickers.claim = claim_then_close
-        outcome = await send_sticker(event, selection)
-        assert outcome["status"] == "not_available"
-        assert outcome["reason"] == "sticker_acquisition_failed"
-        acquire_row = adapter.state.sticker_operation("a", "peer", "m1", "acquire:pack1")
-        assert acquire_row["state"] == "failed"
-
-        adapter.client._session = saved_session
-        native.raw = dict(native.raw, id="m2", serverId="901")
-        event2 = await deliver(adapter, native.raw)
-        selection2 = (await find(event2, "晚安"))["items"][0]["selection_id"]
-        assert (await send_sticker(event2, selection2))["status"] == "success"
-    finally:
-        await adapter.terminate()
-
-
-async def test_missing_receipt_reclaim_keeps_concurrent_callers_single_post(serve, tmp_path):
-    from test_stickers import deliver, send_sticker
-
-    native, adapter, first_event = await send_event(serve, tmp_path)
-    native.pack_items[0]["original"] = None
     row, _ = adapter.stickers.claim(
         native.raw,
         "acquire:pack1",
         "b" * 32,
         {"kind": "pack", "packId": "pack1", "stickerId": "b" * 32},
     )
-    adapter.state.finish_sticker(row["idempotency_key"], "needs_review")
-    entered = asyncio.Event()
-    release = asyncio.Event()
-    original_request = adapter.client._request
-    messages = {"m1": dict(native.raw)}
+    if fault == "missing_receipt":
+        adapter.state.finish_sticker(row["idempotency_key"], "needs_review")
+    else:
+        adapter.state.finish_sticker(row["idempotency_key"], "pending", "job1")
+        original = native.job
 
-    async def slow_request(method, path, **kwargs):
-        if method == "POST" and path.endswith("/sticker-downloads"):
-            entered.set()
-            await release.wait()
-        return await original_request(method, path, **kwargs)
+        def job(kind="sticker_saved", job_id="job1"):
+            value = original(kind, job_id)
+            if kind == "sticker_acquire":
+                if fault == "media_rejected":
+                    value.update(
+                        state="failed",
+                        phase="downloading",
+                        reason="media_service_rejected",
+                        message="synthetic-secret",
+                    )
+                    value["result"] = {"serverAcceptance": "accepted"}
+                else:
+                    value.update(
+                        state="needs_review",
+                        phase="submitting",
+                        reason="sticker_submission_needs_review",
+                    )
+                    value["result"] = {"serverAcceptance": "pending", "private": "synthetic-secret"}
+                    if fault == "foreign_job":
+                        value["accountId"] = "synthetic-secret"
+                        value["kind"] = "synthetic-secret"
+            return value
 
-    async def get_message(message_id):
-        return messages[message_id]
-
-    adapter.client._request = slow_request
-    adapter.client.message = get_message
+        native.job = job
     try:
-        raw2 = dict(native.raw, id="m2", serverId="901")
-        messages["m2"] = raw2
-        event2 = await deliver(adapter, raw2)
-        raw3 = dict(native.raw, id="m3", serverId="902")
-        messages["m3"] = raw3
-        event3 = await deliver(adapter, raw3)
-        sel2 = (await find(event2, "晚安"))["items"][0]["selection_id"]
-        sel3 = (await find(event3, "晚安"))["items"][0]["selection_id"]
-
-        task2 = asyncio.create_task(send_sticker(event2, sel2))
-        await asyncio.wait_for(entered.wait(), 1)
-        res3 = await send_sticker(event3, sel3)
-        assert res3["reason"] == "sticker_acquisition_needs_review"
-        release.set()
-        res2 = await task2
-        assert res2["status"] == "success"
-        download_posts = [
-            c for c in native.calls if c[0] == "POST" and c[1].endswith("/sticker-downloads")
-        ]
-        assert len(download_posts) == 1
-        assert download_posts[0][3] == row["idempotency_key"]
-    finally:
-        await adapter.terminate()
-
-
-@pytest.mark.parametrize(
-    ("fault_fields", "expected_code"),
-    [
-        (
-            {"error": {"code": "media_not_available", "message": "synthetic-secret"}},
-            "media_not_available",
-        ),
-        (
-            {"reason": "media_service_rejected", "message": "synthetic-secret"},
-            "media_service_rejected",
-        ),
-    ],
-)
-async def test_failed_acquisition_job_logs_nested_error_code_and_returns_failed(
-    serve, tmp_path, caplog, fault_fields, expected_code
-):
-    from test_stickers import deliver, send_sticker
-
-    native, adapter, event = await send_event(serve, tmp_path)
-    native.pack_items[0]["original"] = None
-    original_job = native.job
-
-    def failed_job(kind="sticker_saved", job_id="job1"):
-        value = original_job(kind, job_id)
-        if kind == "sticker_acquire":
-            value.update(
-                state="failed",
-                phase="downloading",
-                **fault_fields,
-            )
-            value["result"] = {"serverAcceptance": "accepted"}
-        return value
-
-    native.job = failed_job
-    try:
-        selection = (await find(event, "晚安"))["items"][0]["selection_id"]
-        outcome = await send_sticker(event, selection)
-        assert outcome["status"] == "not_available"
-        assert outcome["reason"] == "sticker_acquisition_failed"
-        assert (
-            f"native_state=failed native_phase=downloading "
-            f"native_code={expected_code} acceptance=accepted"
-        ) in caplog.text
+        native.last_kind = "sticker_acquire"
+        await adapter.stickers.recover()
+        if fault == "missing_receipt":
+            assert "stage=missing_receipt" in caplog.text
+        elif fault == "media_rejected":
+            assert (
+                "native_state=failed native_phase=downloading "
+                "native_code=media_service_rejected acceptance=accepted"
+            ) in caplog.text
+        else:
+            assert "native_state=needs_review native_phase=submitting" in caplog.text
+            assert "native_code=sticker_submission_needs_review" in caplog.text
+            assert f"identity_matches={fault != 'foreign_job'}" in caplog.text
         assert "synthetic-secret" not in caplog.text
-
-        # A subsequent message gets a fresh attempt instead of staying locked in needs_review.
-        native.job = original_job
-        native.raw = dict(native.raw, id="m2", serverId="901")
-        event2 = await deliver(adapter, native.raw)
-        selection2 = (await find(event2, "晚安"))["items"][0]["selection_id"]
-        assert (await send_sticker(event2, selection2))["status"] == "success"
+        assert not any(c[0] == "POST" for c in native.calls)
     finally:
         await adapter.terminate()

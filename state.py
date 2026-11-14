@@ -6,6 +6,7 @@ handoff is therefore retained for review rather than automatically handed off tw
 
 import hashlib
 import sqlite3
+import time
 from contextlib import closing
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -85,6 +86,13 @@ def cursor_number(value: str) -> int:
     return int(value)
 
 
+def clean_sticker_caption(value: str | None) -> str:
+    if not isinstance(value, str):
+        return ""
+    cleaned = "".join(" " if ord(c) < 32 or ord(c) == 127 else c for c in value)
+    return " ".join(cleaned.split())[:160]
+
+
 class StateIdentityError(RuntimeError):
     """Stored identity changed; preserve evidence and require operator inspection."""
 
@@ -139,6 +147,14 @@ class StateStore:
                 ON sticker_operations(account, action, content_id)
                 WHERE action LIKE 'acquire:%'
                     AND state IN ('pending','submitting','needs_review');
+            CREATE TABLE IF NOT EXISTS sticker_labels (
+                account TEXT NOT NULL,
+                content_id TEXT NOT NULL,
+                caption TEXT NOT NULL DEFAULT '',
+                ready_gif INTEGER NOT NULL DEFAULT 0,
+                content_type TEXT NOT NULL DEFAULT '',
+                updated_at REAL NOT NULL,
+                PRIMARY KEY(account, content_id));
         """)
         with self.db:
             self.db.execute(
@@ -270,6 +286,53 @@ class StateStore:
                 "AND status!='recalled' AND NOT EXISTS "
                 "(SELECT 1 FROM sends WHERE message_id=messages.id AND state!='accepted')",
                 (key,),
+            )
+
+    def sticker_label(self, account: str, content_id: str) -> dict | None:
+        row = self.db.execute(
+            "SELECT * FROM sticker_labels WHERE account=? AND content_id=?",
+            (account, content_id.lower()),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def sticker_labels(self, account: str) -> dict[str, dict]:
+        rows = self.db.execute(
+            "SELECT * FROM sticker_labels WHERE account=?", (account,)
+        ).fetchall()
+        return {row["content_id"]: dict(row) for row in rows}
+
+    def upsert_sticker_label(
+        self,
+        account: str,
+        content_id: str,
+        *,
+        caption: str | None = None,
+        ready_gif: bool | None = None,
+        content_type: str | None = None,
+    ):
+        cleaned = clean_sticker_caption(caption) if caption is not None else ""
+        now = time.time()
+        with self.db:
+            existing = self.sticker_label(account, content_id)
+            next_caption = cleaned if cleaned else (existing["caption"] if existing else "")
+            next_ready = (
+                (1 if ready_gif else 0)
+                if ready_gif is not None
+                else (existing["ready_gif"] if existing else 0)
+            )
+            next_type = (
+                content_type[:64]
+                if content_type is not None
+                else (existing["content_type"] if existing else "")
+            )
+            self.db.execute(
+                "INSERT INTO sticker_labels "
+                "(account, content_id, caption, ready_gif, content_type, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(account, content_id) DO UPDATE SET "
+                "caption=excluded.caption, ready_gif=excluded.ready_gif, "
+                "content_type=excluded.content_type, updated_at=excluded.updated_at",
+                (account, content_id.lower(), next_caption, next_ready, next_type, now),
             )
 
     def action_intent(self, account, thread, trigger):

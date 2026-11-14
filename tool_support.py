@@ -44,6 +44,7 @@ STICKER_ERROR_MESSAGES = {
     "sticker_acquisition_needs_review": (
         "选中表情的资源获取结果尚未确认，尚未提交表情发送；保留原回执，不重复获取。"
     ),
+    "sticker_saved_original_unavailable": "选中收藏表情本地尚无可用的 GIF 缓存，尚未提交表情发送。",
     "sticker_pack_original_unavailable": "选中表情尚无可验证的原始 GIF，尚未提交表情发送。",
 }
 

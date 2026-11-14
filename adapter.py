@@ -153,6 +153,7 @@ class WeChatNativeAdapter(Platform):
         self.history = HistoryTools(self)
         self.actions = WeChatActions(self)
         self.stickers = StickerService(self)
+        self.sticker_labeler = None
         self._terminate_lock = asyncio.Lock()
         self._last_time_warning = float("-inf")
         self.summary_cache = GroupSummaryCache(cfg.summary_max_messages, cfg.summary_window_minutes)

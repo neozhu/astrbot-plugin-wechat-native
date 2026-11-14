@@ -1,18 +1,20 @@
 # SPEC — WeChat Native Sticker Receive, Save & Send
 
-**版本：** v1.2（按用户追加要求调整收藏策略）
+**版本：** v1.3（适配 Native v2.4.1 纯本地缓存与本地描述索引方案）
 
 **目标插件：** v0.3.15（测试期间保持版本号）
-**仓库：** `neozhu/astrbot-plugin-wechat-native`  
+**仓库：** `neozhu/astrbot-plugin-wechat-native`
 **基线：** `cb5e5c6`（v0.3.15，初版基线为 v0.3.14）
-**Native：** v2.4.0  
+**Native：** v2.4.1
 **开发原则：** 复用现有架构、最小配置、TDD、避免重复操作
+
+> **v1.3 变更说明：** 上游 Native v2.4.1 的官方包下载接口（`POST /sticker-downloads`）存在 CDN HTTP 400（`media_service_rejected`，见 [Issue #507](https://github.com/thisnick/agent-wechat/issues/507)），且本地无 GIF 缓存的 `Saved` 表情在缺少白名单 `cdnUrl` 时会返回 `409 sticker_source_not_allowed`；同时微信 `Saved` 列表绝大多数没有官方 `caption`。v1.3 将“发送候选与检索”全面收敛为**仅使用本地已有可用 GIF 缓存**，并在插件 SQLite（`sticker_labels`）中保存本地描述标签（支持引用收藏时由模型写入或基于本地预览图补标，不修改微信/Native 官方库）。
 
 ## 1. 开发目标
 
-第一阶段仅完成两个功能。
+第一阶段完成两个功能闭环。
 
-### Feature A — 读取并收藏引用表情
+### Feature A — 读取、去重收藏引用表情与本地标注
 
 支持私聊及群聊中引用别人发送的微信表情包：
 
@@ -20,24 +22,25 @@
 - 在允许群聊中，任何成员引用有效 Sticker 时自动保存到机器人微信账号的 Saved 收藏。
 - 收藏不需要管理员、明确请求、@或 LLM 工具调用；私聊仅在调用工具时收藏，任何允许交互的用户均可使用。
 - **收藏前自动去重，已经收藏的表情不再重复保存。**
+- `wechat_save_quoted_sticker` 支持可选传入 `caption`（模型基于当前画面给出的简短中文内容/情绪关键词），在收藏确认或已存在时写入插件本地 `sticker_labels` 表（**不传给 Native `POST /custom-stickers`**）；后台静默自动收藏在开启 `enable_media` 且配置可用视觉模型时，也可基于预览图异步补写本地描述（失败静默降级，不阻塞收藏）。
 - 下载失败、格式不支持或引用被撤回时，返回准确结果。
 
 视觉问答遵守现有真实 `@机器人` 唤醒规则；群聊自动收藏静默执行，不唤醒模型。
 
-### Feature B — 原生表情发送
+### Feature B — 基于本地缓存的原生表情检索与发送
 
-支持两种来源：
+支持两种来源，**但仅暴露本地已有可验证原始 `image/gif` 缓存的候选**：
 
-- 个人 Saved 收藏。
-- 微信账号已添加的官方表情包（Official Packs）。
+- 个人 Saved 收藏：经 `GET /custom-stickers/{id}`（并缓存在 `sticker_labels.ready_gif`）验证本地已有可用 `image/gif` 缓存的项。
+- 微信账号已添加的官方表情包（Official Packs）：仅包含 `original` 已经满足 `state=available` 且为 `image/gif` 的项；**不触发在线包下载**。
 
-AI 可根据用户请求或正常聊天语境选择合适的表情，不必每次明确说“发个表情”。
+AI 可根据用户请求或正常聊天语境，通过官方 `caption`、官方包名及插件本地 `sticker_labels` 描述检索表情，不必每次明确说“发个表情”。
 
 发送必须使用 Native Sticker API，不能将表情降级为普通图片发送。
 
 ## 2. 非目标
 
-不实现自动视觉打标、Embedding 搜索、表情编辑器、批量导入、自动购买或添加官方表情包、独立管理 UI、跨账号同步及完整 GIF 动画理解。
+不实现 Embedding 向量检索、表情编辑器、本地静态图片转 GIF 批量导入、自动购买或添加官方表情包、独立标签管理 UI、跨账号同步及完整 GIF 动画理解。
 
 不自动收藏直接发送的 Sticker 或私聊引用；只自动收藏允许群聊中的有效引用。
 输入框里的小黄脸是文字表情，不作为 Sticker 图片下载或收藏。
@@ -134,9 +137,9 @@ GIF 可以提取代表帧供模型理解，但不能把静态帧分析声称为�
 
 新增：
 
-`wechat_save_quoted_sticker()`
+`wechat_save_quoted_sticker(caption: str = "")`
 
-不接受外部传入的 `messageId`、`assetId` 或目标账号。
+不接受外部传入的 `messageId`、`assetId` 或目标账号。`caption` 仅作为插件本地 SQLite 标签索引，不发送到 Native API。
 
 从当前可信事件中确定引用来源。
 
@@ -237,10 +240,11 @@ Native Job 类型：`sticker_saved`。
 
 ### 6.1 来源 API
 
-Saved：
+Saved（列表 + 本地缓存状态核对）：
 
 ```http
 GET /v1/accounts/{accountId}/custom-stickers
+GET /v1/accounts/{accountId}/custom-stickers/{stickerId}
 ```
 
 官方表情包：
@@ -250,16 +254,18 @@ GET /v1/accounts/{accountId}/sticker-packs?membership=added
 GET /v1/accounts/{accountId}/sticker-packs/{packId}/stickers
 ```
 
-只允许选择当前账号已添加的官方表情包。
-
-缺少可用原始 GIF 时，可以通过 `POST /sticker-downloads` 按需获取选中的单个表情；不得自动下载整包。
+只允许选择当前账号已添加的官方表情包，并且严格过滤：
+- Saved 项必须在 `custom-stickers/{stickerId}`（或本地 `sticker_labels` 缓存，发送前必再次实查详情）中确认 `original` 为 `state=available`、`variant=original`、`actualVariant=original`、`contentType=image/gif`。
+- 官方包项必须在 `/stickers` 返回中 `original` 已处于 `state=available` 且为 `image/gif`。
+- 未在本地缓存为可用 GIF 的 Saved/Pack 项**不返回给模型，不调用 `POST /sticker-downloads`**（规避 Native v2.4.1 Issue #507 与 409 `sticker_source_not_allowed`）。
+- 对于本地已有缓存但既无官方 `caption` 又无本地标签的 Saved 项，查找时可在开启 `enable_media` 时按有界配额读取只读预览图，调用现有配置模型生成简短本地描述写入 `sticker_labels`；失败时保持空描述，不影响返回或发送。
 
 ### 6.2 LLM Tools
 
 **`wechat_find_stickers(query: str = "", limit: int = 12)`**
 
-- 从 Saved 和已添加官方表情包中查找候选。
-- 优先使用官方 `caption` 与表情包名称。
+- 仅从本地已有可用 `image/gif` 缓存的 Saved 与已添加官方表情包中查找候选。
+- 合并匹配官方 `caption`、官方包名与插件本地 `sticker_labels` 描述。
 - 返回有限候选列表。
 - 不根据未知图片 ID 猜测含义。
 - 不自动发送。
@@ -267,7 +273,7 @@ GET /v1/accounts/{accountId}/sticker-packs/{packId}/stickers
 **`wechat_send_sticker(selection_id: str)`**
 
 - 仅接受当前事件对应的候选。
-- 再次验证账号、表情成员关系和当前聊天。
+- 发送前再次实查账号、表情成员关系、当前聊天以及本地 `image/gif` 就绪状态（缺少本地可用 GIF 原图时返回 `sticker_saved_original_unavailable` / `sticker_pack_original_unavailable`，不触发在线获取）。
 - 不允许自定义跨群发送目标。
 - 发送原生 Sticker。
 - 每条触发消息最多发送一个表情。
@@ -355,6 +361,19 @@ updated_at
 
 不存储原始媒体文件、聊天正文或 Token。
 
+同时新增轻量级本地标注与缓存索引表 `sticker_labels`：
+
+```text
+account
+content_id
+caption
+ready_gif
+content_type
+updated_at
+```
+
+- 主键为 `(account, content_id)`，仅保存简短文字描述与本地 GIF 就绪布尔/类型摘要，不保存表情图片二进制，也不作为 Saved 成员存在依据（仍以 Native `/custom-stickers` 为准）。
+
 ## 8. 主要改动文件
 
 | 文件 | 变更 |
@@ -394,11 +413,11 @@ updated_at
 
 ### C. 原生发送（6 项）
 
-- [ ] Saved 目录查询正常。
-- [ ] 已添加官方表情包查询正常，未添加表情包不得发送。
-- [ ] Saved 表情使用 `source.kind=saved`。
-- [ ] 官方表情使用 `source.kind=pack`，必要时按需获取单个原始资源。
-- [ ] `sticker_send` 的成功回执正确判断。
+- [ ] Saved 目录经 `custom-stickers/{id}` 与 `sticker_labels` 过滤为本地可用 `image/gif`，未缓存或 WXGF 项不暴露给模型。
+- [ ] 已添加官方表情包仅返回 `original` 已就绪为 `image/gif` 的项，不触发在线 `POST /sticker-downloads`。
+- [ ] Saved 表情使用 `source.kind=saved`，发送前再次核对本地 GIF 就绪。
+- [ ] 官方表情使用 `source.kind=pack`，本地未就绪时返回 `sticker_pack_original_unavailable`。
+- [ ] `sticker_send` 的成功回执正确判断，本地描述合并官方 `caption` 与 `sticker_labels`。
 - [ ] 重复 Tool Calling、断线和未知发送结果不会产生二次发送。
 
 ### D. 回归与兼容（3 项）
@@ -468,8 +487,9 @@ python -m compileall -q .
 2. 再比较当前 Saved 中的内容 ID。
 3. 通过数据库约束防止并发重复提交。
 4. 最后依靠 Native 幂等与状态协调确认真实结果。
+5. `caption` 只写入插件本地 `sticker_labels` 表，不传给 Native `POST /custom-stickers` 接口。
 
-不要增加标签管理、独立 UI、定时任务或无关功能。
+不要增加独立标签管理 UI、定时批量扫描任务或无关功能。
 
 完成后输出代码改动、20 项核心测试结果、已有回归测试结果、6 项真实验收结果及已知限制。
 

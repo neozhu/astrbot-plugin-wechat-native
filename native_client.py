@@ -1018,6 +1018,11 @@ class NativeClient:
     async def custom_stickers(self):
         return await self._request("GET", self.prefix + "/custom-stickers")
 
+    async def custom_sticker(self, sticker_id):
+        return await self._request(
+            "GET", self.prefix + "/custom-stickers/" + quote(sticker_id, safe="")
+        )
+
     async def sticker_packs(self):
         return await self._request(
             "GET", self.prefix + "/sticker-packs", params={"membership": "added"}

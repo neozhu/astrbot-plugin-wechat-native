@@ -260,9 +260,9 @@ async def save_event(serve, tmp_path, **options):
     return native, adapter, await deliver(adapter, raw)
 
 
-async def save(event):
+async def save(event, caption=""):
     plugin = object.__new__(module("main").WeChatNativePlugin)
-    return json.loads(await plugin.wechat_save_quoted_sticker(event))
+    return json.loads(await plugin.wechat_save_quoted_sticker(event, caption))
 
 
 async def test_save_requires_confirmed_writeback_and_reuses_receipt(serve, tmp_path):
@@ -395,7 +395,13 @@ async def send_sticker(event, selection):
 
 async def send_event(serve, tmp_path, **options):
     native, adapter = await setup(serve, tmp_path, message(), **options)
-    native.saved = [{"id": CONTENT_ID, "caption": "开心", "original": None}]
+    native.saved = [
+        {
+            "id": CONTENT_ID,
+            "caption": "开心",
+            "original": dict(native.asset, id=f"sticker_saved_{CONTENT_ID}", messageId=None),
+        }
+    ]
     native.packs = [{"id": "pack1", "name": "小猫", "membership": "added"}]
     native.pack_items = [
         {
@@ -1160,173 +1166,197 @@ async def test_unknown_sticker_outcome_suppresses_followup_without_another_post(
         await adapter.terminate()
 
 
-async def test_missing_pack_original_acquires_only_selected_item_before_send(serve, tmp_path):
-    native, adapter, event = await send_event(serve, tmp_path)
-    native.pack_items[0]["original"] = None
-    native.acquire_polls = 1
-    adapter.client.poll_interval = 0.001
-    real_job = adapter.client.job
-
-    async def job(job_id):
-        row = adapter.state.sticker_operation("a", "peer", "m1", "acquire:pack1")
-        assert row["job_id"] == job_id and row["state"] == "pending"
-        return await real_job(job_id)
-
-    adapter.client.job = job
-    try:
-        choice = (await find(event, "晚安"))["items"][0]["selection_id"]
-        assert not any(c[0] == "POST" for c in native.calls)
-        assert (await send_sticker(event, choice))["status"] == "success"
-        assert (await send_sticker(event, choice))["status"] == "success"
-        posts = [c for c in native.calls if c[0] == "POST"]
-        assert len(posts) == 2
-        assert posts[0][1].endswith("/sticker-downloads")
-        assert posts[0][2] == {"packId": "pack1", "stickerId": "b" * 32}
-        acquisition = adapter.state.sticker_operation("a", "peer", "m1", "acquire:pack1")
-        assert acquisition["state"] == "success" and acquisition["job_id"] == "job1"
-        assert posts[0][3] == acquisition["idempotency_key"]
-        assert posts[1][1].endswith("/sends") and posts[1][2]["source"]["kind"] == "pack"
-        assert posts[0][3] != posts[1][3]
-    finally:
-        await adapter.terminate()
-
-
-@pytest.mark.parametrize(
-    "fault",
-    [
-        "failed",
-        "missing_original",
-        "foreign_original",
-        "not_gif",
-        "foreign_job",
-        "wrong_pack",
-        "lost",
-        "timeout",
-    ],
-)
-async def test_unready_pack_never_submits_send_or_reposts_unknown_acquisition(
-    serve, tmp_path, fault
+async def test_unready_stickers_are_filtered_from_catalog_and_never_trigger_pack_download(
+    serve, tmp_path
 ):
     native, adapter, event = await send_event(serve, tmp_path)
-    native.pack_items[0]["original"] = None
-    native.acquire_fault = fault
-    if fault == "lost":
-        native.post_status = 503
-    if fault == "timeout":
-        native.acquire_polls = 1000
-    adapter.client.media_timeout = 0.03
-    adapter.client.poll_interval = 0.001
+    uncached_id = "c" * 32
+    wxgf_id = "d" * 32
+    native.saved = [
+        {"id": CONTENT_ID, "caption": "", "original": None},
+        {"id": uncached_id, "caption": "未缓存表情", "original": None},
+        {"id": wxgf_id, "caption": "专有格式", "original": None},
+    ]
+    detail_responses = {
+        CONTENT_ID: {
+            "id": CONTENT_ID,
+            "caption": "已缓存猫猫",
+            "original": dict(native.asset, id=f"sticker_saved_{CONTENT_ID}", messageId=None),
+        },
+        uncached_id: {"id": uncached_id, "caption": "未缓存表情", "original": None},
+        wxgf_id: {
+            "id": wxgf_id,
+            "caption": "专有格式",
+            "original": dict(
+                native.asset,
+                id=f"sticker_saved_{wxgf_id}",
+                messageId=None,
+                contentType="image/x-wxgf",
+            ),
+        },
+    }
+    original_request = adapter.client._request
+
+    async def custom_detail(method, path, **kwargs):
+        if method == "GET" and "/custom-stickers/" in path:
+            sid = path.rsplit("/", 1)[1]
+            native.calls.append((method, path, None, None))
+            return detail_responses.get(sid, {})
+        return await original_request(method, path, **kwargs)
+
+    adapter.client._request = custom_detail
+    native.pack_items = [
+        {"id": "b" * 32, "packId": "pack1", "caption": "未下载官方图", "original": None},
+        {
+            "id": "e" * 32,
+            "packId": "pack1",
+            "caption": "png非gif",
+            "original": dict(native.asset, id="pack-png", messageId=None, contentType="image/png"),
+        },
+        {
+            "id": "f" * 32,
+            "packId": "pack1",
+            "caption": "就绪官方图",
+            "original": dict(native.asset, id="pack-gif", messageId=None),
+        },
+    ]
     try:
-        choice = (await find(event, "晚安"))["items"][0]["selection_id"]
-        data = await send_sticker(event, choice)
-        assert data["status"] == "not_available"
-        assert data["reason"].startswith("sticker_")
-        await send_sticker(event, choice)
-        posts = [c for c in native.calls if c[0] == "POST"]
-        assert len(posts) == 1 and posts[0][1].endswith("/sticker-downloads")
-        row = adapter.state.sticker_operation("a", "peer", "m1", "send")
-        assert adapter.state.send_record(row["idempotency_key"]) is None
-        assert row["state"] == "failed"  # No send was submitted.
-        if fault in {"lost", "timeout"}:
-            cfg = dict(adapter.config)
-            await adapter.terminate()
-            adapter = module("adapter").WeChatNativeAdapter(
-                cfg, {}, asyncio.Queue(), state_dir=tmp_path
-            )
-            adapter.bot_self_id = "bot"
-            await adapter.client.open()
-            adapter.client.media_timeout = 0.03
-            adapter.client.poll_interval = 0.001
-            await adapter.stickers.recover()
-            if fault == "timeout":
-                native.raw = dict(native.raw, id="m2", serverId="901")
-                event = await deliver(adapter, native.raw)
-                choice = (await find(event, "晚安"))["items"][0]["selection_id"]
-                assert (await send_sticker(event, choice))["status"] == "not_available"
-                assert len([c for c in native.calls if c[0] == "POST"]) == 1
-            else:
-                # Missing-receipt acquisition reuses the original Idempotency-Key on a new turn
-                # and succeeds once Native recovers, without ever submitting /sends on failure.
-                assert len([c for c in native.calls if c[0] == "POST"]) == 1
-                native.raw = dict(native.raw, id="m2", serverId="901")
-                event = await deliver(adapter, native.raw)
-                choice = (await find(event, "晚安"))["items"][0]["selection_id"]
-                assert (await send_sticker(event, choice))["status"] == "not_available"
-                posts = [c for c in native.calls if c[0] == "POST"]
-                assert len(posts) == 2
-                assert posts[0][3] == posts[1][3]
-                assert not any(c[1].endswith("/sends") for c in posts)
-                adapter.client.media_timeout = 1
-                native.post_status = 202
-                native.raw = dict(native.raw, id="m3", serverId="902")
-                event = await deliver(adapter, native.raw)
-                choice = (await find(event, "晚安"))["items"][0]["selection_id"]
-                assert (await send_sticker(event, choice))["status"] == "success"
-                posts = [c for c in native.calls if c[0] == "POST"]
-                assert posts[2][1].endswith("/sticker-downloads") and posts[2][3] == posts[0][3]
-                assert posts[3][1].endswith("/sends")
+        found = await find(event)
+        assert found["ok"] and found["count"] == 2
+        assert {item["source"] for item in found["items"]} == {"saved", "pack"}
+        assert not (await find(event, "未缓存"))["items"]
+        assert not (await find(event, "专有格式"))["items"]
+        assert not (await find(event, "未下载官方图"))["items"]
+        assert not (await find(event, "png非gif"))["items"]
+        assert found["catalog"]["saved_count"] == 3
+        assert found["catalog"]["saved_ready_count"] == 1
+        assert found["catalog"]["pack_ready_count"] == 1
+
+        # Once cached in sticker_labels, subsequent find() skips /custom-stickers/{CONTENT_ID}.
+        def ready_detail_calls():
+            return sum(1 for c in native.calls if c[1].endswith(f"/custom-stickers/{CONTENT_ID}"))
+
+        before_ready_calls = ready_detail_calls()
+        assert before_ready_calls == 1
+        await find(event)
+        assert ready_detail_calls() == before_ready_calls
+        assert not any(c[0] == "POST" for c in native.calls)
     finally:
         await adapter.terminate()
 
 
-@pytest.mark.parametrize("change", ["membership", "disabled", "recalled"])
-async def test_pack_acquisition_rechecks_authority_before_send(serve, tmp_path, change):
+@pytest.mark.parametrize("source", ["saved", "pack"])
+async def test_send_rejects_unready_original_without_pack_download(serve, tmp_path, source):
     native, adapter, event = await send_event(serve, tmp_path)
-    native.pack_items[0]["original"] = None
-    original_download = native.job
-
-    def job(kind="sticker_saved", job_id="job1"):
-        data = original_download(kind, job_id)
-        if kind == "sticker_acquire":
-            if change == "membership":
-                native.packs[0]["membership"] = "not_added"
-            elif change == "disabled":
-                adapter.native_config.enable_stickers = False
-            else:
-                native.raw["recall"] = {"state": "recalled"}
-        return data
-
-    native.job = job
     try:
-        choice = (await find(event, "晚安"))["items"][0]["selection_id"]
-        assert not (await send_sticker(event, choice))["ok"]
-        posts = [c for c in native.calls if c[0] == "POST"]
-        assert len(posts) == 1 and posts[0][1].endswith("/sticker-downloads")
+        choice = next(c for c in (await find(event))["items"] if c["source"] == source)
+        if source == "saved":
+            native.saved[0]["original"] = None
+            expected_reason = "sticker_saved_original_unavailable"
+        else:
+            native.pack_items[0]["original"] = None
+            expected_reason = "sticker_pack_original_unavailable"
+        outcome = await send_sticker(event, choice["selection_id"])
+        assert outcome["status"] == "not_available"
+        assert outcome["reason"] == expected_reason
+        assert not any(c[0] == "POST" for c in native.calls)
     finally:
         await adapter.terminate()
 
 
-async def test_pack_acquisition_cancellation_retains_job_and_recovery_never_sends(serve, tmp_path):
-    native, adapter, event = await send_event(serve, tmp_path)
-    native.pack_items[0]["original"] = None
-    native.acquire_polls = 1
-    entered = asyncio.Event()
-    real_job = adapter.client.job
-
-    async def waiting(job_id):
-        entered.set()
-        await asyncio.Future()
-
-    adapter.client.job = waiting
-    adapter.client.poll_interval = 0.001
+async def test_save_stores_local_caption_for_find_and_respects_phone_deletion(serve, tmp_path):
+    native, adapter, event = await save_event(serve, tmp_path)
     try:
-        choice = (await find(event, "晚安"))["items"][0]["selection_id"]
-        task = asyncio.create_task(send_sticker(event, choice))
-        await asyncio.wait_for(entered.wait(), 1)
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-        row = adapter.state.sticker_operation("a", "peer", "m1", "acquire:pack1")
-        assert row["state"] == "needs_review" and row["job_id"] == "job1"
-        adapter.client.job = real_job
-        await adapter.stickers.recover()
-        assert (
-            adapter.state.sticker_operation("a", "peer", "m1", "acquire:pack1")["state"]
-            == "success"
-        )
-        assert len([c for c in native.calls if c[0] == "POST"]) == 1
-        assert not (await send_sticker(event, choice))["ok"]
-        assert not any(c[0] == "POST" and c[1].endswith("/sends") for c in native.calls)
+        saved_res = await save(event, caption="小猫流泪 伤心 委屈")
+        assert saved_res["status"] == "success"
+        posts = [c for c in native.calls if c[0] == "POST"]
+        assert len(posts) == 1
+        assert "caption" not in posts[0][2]
+        assert "caption" not in posts[0][2]["source"]
+
+        # Re-saving / annotating an already_saved item updates local label cleanly.
+        native.saved = [{"id": CONTENT_ID, "caption": None, "original": None}]
+        native.raw = dict(native.raw, id="m2", serverId="901")
+        native.asset["messageId"] = "m2"
+        event2 = await deliver(adapter, native.raw)
+        assert (await save(event2, caption="伤心 哭哭"))["status"] == "already_saved"
+
+        # Expose ready local GIF cache on Saved item with empty official caption.
+        native.saved = [
+            {
+                "id": CONTENT_ID,
+                "caption": None,
+                "original": dict(native.asset, id=f"sticker_saved_{CONTENT_ID}", messageId=None),
+            }
+        ]
+        native.raw = message(id="m3", serverId="902")
+        search_event = await deliver(adapter, native.raw)
+        found = await find(search_event, "伤心")
+        assert found["count"] == 1
+        assert found["items"][0]["source"] == "saved"
+        assert "伤心" in found["items"][0]["caption"]
+        assert (await send_sticker(search_event, found["items"][0]["selection_id"]))[
+            "status"
+        ] == "success"
+
+        # Phone deletion still removes the sticker from find() despite local sticker_labels row.
+        native.saved = []
+        assert (await find(search_event, "伤心"))["count"] == 0
+    finally:
+        await adapter.terminate()
+
+
+async def test_auto_save_and_find_use_vision_labeler_for_missing_captions(serve, tmp_path):
+    native, adapter = await setup(
+        serve, tmp_path, group_quote(), enable_history_tools=False, group_reply_mode="all"
+    )
+    labeled_umo = []
+
+    async def fake_labeler(preview_png, umo=""):
+        labeled_umo.append((len(preview_png) > 0, umo))
+        return "熊猫头 抱拳 感谢\n谢谢"
+
+    adapter.sticker_labeler = fake_labeler
+    try:
+        await process_quote(adapter, native.raw)
+        row = adapter.state.sticker_label("a", CONTENT_ID)
+        assert row is not None
+        assert row["caption"] == "熊猫头 抱拳 感谢 谢谢"
+        assert row["ready_gif"] == 1
+        assert labeled_umo and labeled_umo[0][0] and labeled_umo[0][1].endswith(":room@chatroom")
+
+        # Unlabelled locally-cached Saved sticker gets labeled during find() via plugin labeler.
+        other_id = "e" * 32
+        native.saved = [
+            {
+                "id": CONTENT_ID,
+                "caption": "",
+                "original": dict(native.asset, id=f"sticker_saved_{CONTENT_ID}", messageId=None),
+            },
+            {
+                "id": other_id,
+                "caption": "",
+                "original": dict(native.asset, id=f"sticker_saved_{other_id}", messageId=None),
+            },
+        ]
+        native.raw = message(id="m2", serverId="901")
+        search_event = await deliver(adapter, native.raw)
+
+        class FakeContext:
+            async def get_current_chat_provider_id(self, umo):
+                return "prov1"
+
+            async def llm_generate(self, *, chat_provider_id, prompt, image_urls):
+                assert chat_provider_id == "prov1"
+                assert len(image_urls) == 1 and image_urls[0].startswith("data:image/png;base64,")
+                return type("Resp", (), {"completion_text": "小狗 开心 摇尾巴"})()
+
+        plugin = object.__new__(module("main").WeChatNativePlugin)
+        plugin.context = FakeContext()
+        data = json.loads(await plugin.wechat_find_stickers(search_event, "开心"))
+        assert data["count"] == 1
+        assert "小狗" in data["items"][0]["caption"]
+        assert adapter.state.sticker_label("a", other_id)["caption"] == "小狗 开心 摇尾巴"
     finally:
         await adapter.terminate()
 
