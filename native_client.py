@@ -90,6 +90,7 @@ _SAFE_CODES = {
     "sticker_pack_not_added",
     "custom_sticker_not_found",
     "unsupported_sticker_send_format",
+    "sticker_send_rejected",
     "media_queue_full",
     "media_service_rejected",
     "sticker_submission_needs_review",
@@ -1795,27 +1796,114 @@ class NativeClient:
                         record_job(job_id)
                     payload = value.get("result")
                     payload = payload if isinstance(payload, dict) else {}
-                    server_id = value.get("serverMessageId")
+                    top_server_id = value.get("serverMessageId")
+                    nested_server_id = payload.get("serverMessageId")
+                    server_id = top_server_id if top_server_id is not None else nested_server_id
                     if (
                         value.get("state") == "available"
                         and payload.get("serverAcceptance") == "accepted"
                         and isinstance(server_id, str)
                         and server_id.strip()
                         and len(server_id) <= 128
-                        and (payload.get("serverMessageId") in {None, server_id})
+                        and (top_server_id is None or nested_server_id in {None, top_server_id})
                     ):
-                        return value
+                        return {**value, "serverMessageId": server_id}
+                    raw_state = value.get("state")
+                    raw_phase = value.get("phase")
+                    raw_acceptance = payload.get("serverAcceptance")
+                    raw_reason = value.get("reason")
+                    safe_state = (
+                        raw_state
+                        if raw_state
+                        in {
+                            "queued",
+                            "running",
+                            "available",
+                            "needs_review",
+                            "failed",
+                            "cancelled",
+                            "expired",
+                            "unsupported",
+                        }
+                        else "unknown"
+                    )
+                    safe_phase = (
+                        raw_phase
+                        if raw_phase
+                        in {
+                            "queued",
+                            "preparing",
+                            "downloading",
+                            "reserving",
+                            "uploading",
+                            "submitting",
+                            "readback",
+                            "projecting",
+                            "completed",
+                        }
+                        else "unknown"
+                    )
+                    safe_acceptance = (
+                        raw_acceptance
+                        if raw_acceptance
+                        in {"pending", "accepted", "uncertain", "not_attempted", "rejected"}
+                        else "unknown"
+                    )
+                    safe_reason = (
+                        raw_reason
+                        if isinstance(raw_reason, str) and raw_reason in _SAFE_CODES
+                        else ("none" if raw_reason is None else "unknown")
+                    )
                     if value.get("state") in {"failed", "cancelled"} and payload.get(
                         "serverAcceptance"
                     ) in {"not_attempted", "rejected"}:
+                        logger.warning(
+                            "WeChat Native 表情发送回执失败：receipt_key=%s job_id=%s state=%s "
+                            "phase=%s acceptance=%s reason=%s",
+                            key,
+                            job_id,
+                            safe_state,
+                            safe_phase,
+                            safe_acceptance,
+                            safe_reason,
+                        )
                         raise SendError("failed", key, job_id)
                     if value.get("state") not in {"queued", "running"}:
+                        logger.warning(
+                            "WeChat Native 表情发送回执待核对：receipt_key=%s job_id=%s state=%s "
+                            "phase=%s acceptance=%s reason=%s has_server_id=%s",
+                            key,
+                            job_id,
+                            safe_state,
+                            safe_phase,
+                            safe_acceptance,
+                            safe_reason,
+                            isinstance(server_id, str) and bool(server_id.strip()),
+                        )
                         raise SendError("needs_review", key, job_id)
                     if asyncio.get_running_loop().time() >= deadline:
+                        logger.warning(
+                            "WeChat Native 表情发送回执轮询超时：receipt_key=%s job_id=%s state=%s "
+                            "phase=%s acceptance=%s",
+                            key,
+                            job_id,
+                            safe_state,
+                            safe_phase,
+                            safe_acceptance,
+                        )
                         raise SendError("needs_review", key, job_id)
                     await asyncio.sleep(self.poll_interval)
                     value = None
-        except (NativeAPIError, TimeoutError):
+        except (NativeAPIError, TimeoutError) as error:
+            logger.warning(
+                "WeChat Native 表情发送回执查询异常：receipt_key=%s job_id=%s error_type=%s "
+                "http=%s code=%s",
+                key,
+                job_id,
+                type(error).__name__,
+                error.status if isinstance(error, NativeAPIError) else None,
+                error.code if isinstance(error, NativeAPIError) else "none",
+            )
             raise SendError("needs_review", key, job_id) from None
 
     async def send_image(
