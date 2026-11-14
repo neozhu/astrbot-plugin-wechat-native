@@ -417,3 +417,45 @@ async def test_missing_receipt_reclaim_keeps_concurrent_callers_single_post(serv
         assert download_posts[0][3] == row["idempotency_key"]
     finally:
         await adapter.terminate()
+
+
+async def test_failed_acquisition_job_logs_nested_error_code_and_returns_failed(
+    serve, tmp_path, caplog
+):
+    from test_stickers import deliver, send_sticker
+
+    native, adapter, event = await send_event(serve, tmp_path)
+    native.pack_items[0]["original"] = None
+    original_job = native.job
+
+    def failed_job(kind="sticker_saved", job_id="job1"):
+        value = original_job(kind, job_id)
+        if kind == "sticker_acquire":
+            value.update(
+                state="failed",
+                phase="downloading",
+                error={"code": "media_not_available", "message": "synthetic-secret"},
+            )
+            value["result"] = {"serverAcceptance": "accepted"}
+        return value
+
+    native.job = failed_job
+    try:
+        selection = (await find(event, "晚安"))["items"][0]["selection_id"]
+        outcome = await send_sticker(event, selection)
+        assert outcome["status"] == "not_available"
+        assert outcome["reason"] == "sticker_acquisition_failed"
+        assert (
+            "native_state=failed native_phase=downloading "
+            "native_code=media_not_available acceptance=accepted"
+        ) in caplog.text
+        assert "synthetic-secret" not in caplog.text
+
+        # A subsequent message gets a fresh attempt instead of staying locked in needs_review.
+        native.job = original_job
+        native.raw = dict(native.raw, id="m2", serverId="901")
+        event2 = await deliver(adapter, native.raw)
+        selection2 = (await find(event2, "晚安"))["items"][0]["selection_id"]
+        assert (await send_sticker(event2, selection2))["status"] == "success"
+    finally:
+        await adapter.terminate()

@@ -10,7 +10,14 @@ import uuid
 from astrbot.api import logger
 
 from .config import MAX_IMAGE_BYTES
-from .native_client import _SAFE_CODES, MediaError, NativeAPIError, NativeClient, SendError
+from .native_client import (
+    _SAFE_CODES,
+    MediaError,
+    NativeAPIError,
+    NativeClient,
+    SendError,
+    _extract_job_error_code,
+)
 from .tool_support import ToolError, context, is_tool_error, result
 
 
@@ -211,7 +218,13 @@ class StickerService:
     def log_acquisition(self, row, stage, job=None, error=None):
         """Log only receipt identity, known enums/codes and comparison booleans."""
         job = job if isinstance(job, dict) else {}
-        native_state, phase, code = job.get("state"), job.get("phase"), job.get("reason")
+        native_state, phase = job.get("state"), job.get("phase")
+        reason = job.get("reason")
+        code = (
+            reason
+            if isinstance(reason, str) and reason in _SAFE_CODES
+            else _extract_job_error_code(job)
+        )
         native_state = (
             native_state
             if isinstance(native_state, str)
