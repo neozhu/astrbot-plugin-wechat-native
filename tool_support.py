@@ -78,9 +78,10 @@ def encode(value):
             return json.dumps(result(value["action"], "not_available"), ensure_ascii=False)
 
 
-def error_result(action, error):
+def is_tool_error(error):
+    if isinstance(error, ToolError):
+        return True
     error_type = type(error)
-    reason = None
     initializer = error_type.__init__
     namespace = getattr(initializer, "__globals__", None)
     # AstrBot may replace the module object while an existing adapter retains
@@ -92,13 +93,17 @@ def error_result(action, error):
         and getattr(getattr(initializer, "__code__", None), "co_filename", None)
         == ToolError.__init__.__code__.co_filename
     )
-    local_tool_error = (
+    return (
         error_type.__module__ == ToolError.__module__
         and error_type.__qualname__ == ToolError.__qualname__
         and (namespace is globals() or same_source_generation)
         and getattr(error, "status", None) in MESSAGES
     )
-    if isinstance(error, ToolError) or local_tool_error:
+
+
+def error_result(action, error):
+    reason = None
+    if is_tool_error(error):
         status = error.status
         reason = error.reason
         logger.warning(

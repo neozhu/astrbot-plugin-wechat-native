@@ -1038,7 +1038,6 @@ class NativeClient:
             self.prefix + "/sticker-downloads",
             json={"packId": pack_id, "stickerId": sticker_id},
             headers={"Idempotency-Key": key},
-            expected_status=202,
         )
 
     async def media_content(

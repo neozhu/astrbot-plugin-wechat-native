@@ -191,16 +191,33 @@ class StateStore:
         with self.db:
             self.db.execute("BEGIN IMMEDIATE")
             existing = self.sticker_operation(account, thread, trigger, action)
-            if existing:
-                return existing, False
-            if action == "save" or action.startswith("acquire:"):
-                existing = self.db.execute(
+            if not existing and (action == "save" or action.startswith("acquire:")):
+                row = self.db.execute(
                     "SELECT * FROM sticker_operations WHERE account=? AND content_id=? "
                     "AND action=? AND state IN ('pending','submitting','needs_review')",
                     (account, content_id, action),
                 ).fetchone()
-                if existing:
-                    return dict(existing), False
+                if row:
+                    existing = dict(row)
+            if existing:
+                # Pack acquisition without a Native job ID never received an admission
+                # receipt; reclaim the same idempotency key instead of deadlocking forever.
+                if (
+                    action.startswith("acquire:")
+                    and existing["state"] == "needs_review"
+                    and not existing["job_id"]
+                ):
+                    self.db.execute(
+                        "UPDATE sticker_operations SET state='submitting', updated_at=? "
+                        "WHERE idempotency_key=? AND state='needs_review' AND job_id IS NULL",
+                        (now, existing["idempotency_key"]),
+                    )
+                    reclaimed = self.db.execute(
+                        "SELECT * FROM sticker_operations WHERE idempotency_key=?",
+                        (existing["idempotency_key"],),
+                    ).fetchone()
+                    return dict(reclaimed), True
+                return existing, False
             if action == "send" and thread.endswith("@chatroom"):
                 if self.db.execute(
                     "SELECT 1 FROM sticker_operations WHERE account=? AND thread=? "

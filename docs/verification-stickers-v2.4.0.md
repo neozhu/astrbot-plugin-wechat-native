@@ -74,6 +74,26 @@ tool_support.py、tests/test_stickers.py、docs/features.md、本验收记录及
 版本号仍为 v0.3.15，保留原状态库；历史未知请求不重提。发送一条新测试消息：
 “找一个‘哈哈’表情包并发送”，手机确认原生表情显示后才算官方包发送验收通过。
 
+11:42 实机已找到两个“开心”候选，但资源获取返回 `sticker_acquisition_needs_review`。
+用户确认完整重启后仍复现；Native 容器输出只有 Daemon ready，尚无原始 Job/HTTP 错误证据。
+当前不能把故障归因于热重载、Native 超时或具体 Job 契约不符，也不能宣称实机已修复。
+
+- 单独复现了旧 NativeClient 不含新增获取方法时，尚未 POST 就错误留下未知意图的兼容缺陷。
+  当前服务改为在原客户端/认证会话上执行最新获取包装方法，不重建发送架构或状态库。
+  已有未知获取不因替换包装方法而重提。
+- 获取诊断新增阶段、原回执键/Job ID、HTTP/安全错误码、Native state/phase/reason、
+  acceptance 和身份匹配布尔值。缺失 Job ID、HTTP 失败、Native 待核对和身份不符可区分；
+  不输出上游正文、账号内容、CDN 或密钥，不增加写请求。
+- TDD：retained-client-red.txt（1 failed）→retained-client-green.txt（1 passed）；
+  acquisition-diagnostics-red.txt（4 failed）→acquisition-diagnostics-green.txt（5 passed）；
+  acquisition-diagnostics-regression.txt（113 passed，含原 Sticker 场景）。
+- 待只读查看插件 `sticker_operations` 中原获取的 job_id；有 Job ID 时读取原 Job，
+  没有 Job ID 时需结合 Native 持久记录核对，不删除记录、不换幂等键再次获取。
+
+此轮仅修改 native_client.py、sticker_service.py、tests/test_tool_diagnostics.py 和本记录。
+插件版本仍为 v0.3.15，状态结构和依赖不变。更新可增加诊断，但不解除历史未知意图；
+引用收藏、Saved/官方包实际发送以及断线/重启去重仍待真实微信验收。
+
 修改前工作区干净，`main` 为 `2188fc7`；与 `origin/main` (`95b132f`) 的差异只有 SPEC 文档。
 已在修改前阅读六个指定实现文件，并核对 Native v2.4.0 的官方 OpenAPI 和服务端实现。
 

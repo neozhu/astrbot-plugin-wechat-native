@@ -11,7 +11,7 @@ from astrbot.api import logger
 
 from .config import MAX_IMAGE_BYTES
 from .native_client import _SAFE_CODES, MediaError, NativeAPIError, NativeClient, SendError
-from .tool_support import ToolError, context, result
+from .tool_support import ToolError, context, is_tool_error, result
 
 
 def source_hash(value):
@@ -340,10 +340,11 @@ class StickerService:
             elif job.get("state") in {"queued", "running"}:
                 state = "pending"
             elif job.get("state") in {"failed", "cancelled", "expired", "unsupported"}:
-                if action.startswith("transfer:") or payload.get("serverAcceptance") in {
-                    "not_attempted",
-                    "rejected",
-                }:
+                if (
+                    acquiring
+                    or action.startswith("transfer:")
+                    or payload.get("serverAcceptance") in {"not_attempted", "rejected"}
+                ):
                     state = "failed"
         except (NativeAPIError, ToolError, TypeError, AttributeError) as error:
             if acquiring and isinstance(error, NativeAPIError):
@@ -687,22 +688,38 @@ class StickerService:
                         else "sticker_acquisition_needs_review",
                     )
         except BaseException as error:
-            if not isinstance(error, ToolError):
-                retained = self.adapter.state.sticker_operation(
-                    row["account"], row["thread"], row["trigger_message_id"], row["action"]
+            retained = row
+            if not is_tool_error(error):
+                retained = (
+                    self.adapter.state.sticker_operation(
+                        row["account"], row["thread"], row["trigger_message_id"], row["action"]
+                    )
+                    or row
                 )
                 self.log_acquisition(
                     retained, "wait" if retained["job_id"] else "submit", error=error
                 )
+            no_http_attempt = not retained["job_id"] and (
+                (
+                    isinstance(error, NativeAPIError)
+                    and error.status == 0
+                    and error.code != "timeout"
+                )
+                or not isinstance(error, (NativeAPIError, TimeoutError, asyncio.CancelledError))
+                and not is_tool_error(error)
+            )
             state = (
                 "failed"
-                if isinstance(error, NativeAPIError)
-                and 400 <= error.status < 500
-                and error.status not in {408, 409, 429}
+                if no_http_attempt
+                or (
+                    isinstance(error, NativeAPIError)
+                    and 400 <= error.status < 500
+                    and error.status not in {408, 409, 429}
+                )
                 else "needs_review"
             )
             self.adapter.state.finish_sticker(key, state)
-            if isinstance(error, (asyncio.CancelledError, ToolError)):
+            if isinstance(error, asyncio.CancelledError) or is_tool_error(error):
                 raise
             raise ToolError(
                 "not_available",
@@ -786,9 +803,7 @@ class StickerService:
                 else "needs_review"
             )
             self.adapter.state.finish_sticker(key, state)
-            if isinstance(error, asyncio.CancelledError):
-                raise
-            if isinstance(error, ToolError):
+            if isinstance(error, asyncio.CancelledError) or is_tool_error(error):
                 raise
             fields = {}
             if state == "failed" and isinstance(error, NativeAPIError):

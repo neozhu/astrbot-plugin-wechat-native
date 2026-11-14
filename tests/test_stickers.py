@@ -1238,11 +1238,33 @@ async def test_unready_pack_never_submits_send_or_reposts_unknown_acquisition(
             adapter.client.media_timeout = 0.03
             adapter.client.poll_interval = 0.001
             await adapter.stickers.recover()
-            native.raw = dict(native.raw, id="m2", serverId="901")
-            event = await deliver(adapter, native.raw)
-            choice = (await find(event, "晚安"))["items"][0]["selection_id"]
-            assert (await send_sticker(event, choice))["status"] == "not_available"
-            assert len([c for c in native.calls if c[0] == "POST"]) == 1
+            if fault == "timeout":
+                native.raw = dict(native.raw, id="m2", serverId="901")
+                event = await deliver(adapter, native.raw)
+                choice = (await find(event, "晚安"))["items"][0]["selection_id"]
+                assert (await send_sticker(event, choice))["status"] == "not_available"
+                assert len([c for c in native.calls if c[0] == "POST"]) == 1
+            else:
+                # Missing-receipt acquisition reuses the original Idempotency-Key on a new turn
+                # and succeeds once Native recovers, without ever submitting /sends on failure.
+                assert len([c for c in native.calls if c[0] == "POST"]) == 1
+                native.raw = dict(native.raw, id="m2", serverId="901")
+                event = await deliver(adapter, native.raw)
+                choice = (await find(event, "晚安"))["items"][0]["selection_id"]
+                assert (await send_sticker(event, choice))["status"] == "not_available"
+                posts = [c for c in native.calls if c[0] == "POST"]
+                assert len(posts) == 2
+                assert posts[0][3] == posts[1][3]
+                assert not any(c[1].endswith("/sends") for c in posts)
+                adapter.client.media_timeout = 1
+                native.post_status = 202
+                native.raw = dict(native.raw, id="m3", serverId="902")
+                event = await deliver(adapter, native.raw)
+                choice = (await find(event, "晚安"))["items"][0]["selection_id"]
+                assert (await send_sticker(event, choice))["status"] == "success"
+                posts = [c for c in native.calls if c[0] == "POST"]
+                assert posts[2][1].endswith("/sticker-downloads") and posts[2][3] == posts[0][3]
+                assert posts[3][1].endswith("/sends")
     finally:
         await adapter.terminate()
 
