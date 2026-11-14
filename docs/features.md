@@ -16,6 +16,8 @@ Native v2.3.0 账号未认证时，打开插件的 **WeChat Native 面板**，�
 
 ## 支持发送图片
 
+表情应使用下面的[原生表情工具](#原生表情native-v240)，不会降级为普通图片发送。
+
 AstrBot 的 `Image` 组件可发送到微信私聊和群聊，也支持通过已保存会话主动发送。
 可使用 `Image.fromBytes(data)`、`Image.fromFileSystem(path)`、`Image.fromURL(url)`、
 `Image.fromBase64(data)`、`Image.fromIO(stream)`，以及标准 `Image` 的本地路径、file URI、
@@ -51,6 +53,42 @@ URL 图片仅允许公网 HTTP(S) 和 80/443 端口，不携带 Native Token、C
 连接时校验实际 DNS 地址，拒绝内网、环回、链路本地及其他非公网地址；最多跟随 3 次重定向，
 每一跳重新检查。下载总超时 15 秒、连接及连续读取超时各 5 秒，流式限制 10 MiB，
 拒绝压缩传输。内网图床请改为本地路径或 bytes 来源。
+
+## 原生表情（Native v2.4.0）
+
+在机器人参数中开启 `enable_stickers: true`，其默认值为 `false`。
+沿用 `token_file` 中目标账号的 `read + media + send` 权限，不需要独立 Token 或服务。
+收藏管理员沿用 `wechat_action_admins`，与 `enable_wechat_actions`、管理 Token 无关。
+
+引用微信普通表情或分享表情提问；群聊需要真正 @机器人，并遵守群白名单。
+引用读取还需要 `enable_media: true` 和 AstrBot 当前视觉模型。
+媒体从承载引用的回复消息读取，只访问 Native 的已验证资源；GIF 交付代表静态帧，
+不能据此声称理解完整动画。无效、撤回、过期或无法解码的资源不会交给视觉模型。
+
+| 工具 | 用法 |
+| --- | --- |
+| `wechat_save_quoted_sticker()` | 管理员引用表情并明确说“请收藏这个表情”；不接受外部消息、资产或账号 ID |
+| `wechat_find_stickers(query="", limit=12)` | 从 Saved 与已添加官方包的官方 caption/包名查找，最多返回12个当前事件候选，不下载、不发送 |
+| `wechat_send_sticker(selection_id)` | 在当前聊天发送当前事件候选，可用于正常聊天语境；重新检查当前成员关系 |
+
+收藏先验证原始资源并计算实际字节 MD5，再读取当前 Saved 内容 ID；已收藏返回
+`already_saved`，不会提交 POST。SQLite 约束阻止同内容并发收藏，手机删除后的新请求
+会重新读取 Native 目录。WXGF 替代格式或缩略图不能作为收藏原图。
+仅在 `sticker_saved` 的服务器确认和本地写回完成后报告成功。
+
+发送使用 `/sends` 的 `kind=sticker` 和 Saved/pack 来源。缺少单个原始 GIF 时由
+Native 在同一个发送 Job 内按需获取，不自动下载整包，也不会自动添加官方包。
+每条触发消息最多一个表情，同群至少间隔30秒；文本回复仍按原规则处理。
+只有账号、聊天、Job 和有效服务器消息 ID 均通过验证，且服务器明确接受时才报告成功。
+
+`pending` 表示仍在处理，`needs_review` 表示结果未知，二者都不能当作成功或重新提交。
+固定幂等键和回执保存在原 SQLite 状态库，重启只查询原操作。
+Native v2.4.0 没有收藏/媒体下载的按键查询接口；如果连首次 Job ID 都未收到，
+将持续阻塞并等待人工核对，禁止删除状态库或换键盲目重试。
+
+候选保留5分钟，每个事件最多保留最近120个，单次查找最多读取前50个已添加官方包。
+仅按官方文字子串查找，没有描述的 Saved 不能猜测含义；不做视觉打标、语义搜索或自动收藏。
+升级流程、自动测试及待执行的手机验收见[验收与升级记录](verification-stickers-v2.4.0.md)。
 
 ## 微信语音收发
 

@@ -12,6 +12,7 @@ from .native_client import NativeAPIError
 
 MESSAGES = {
     "success": "操作已完成",
+    "already_saved": "这个表情已在微信收藏中，无需重复收藏",
     "permission_denied": "当前没有权限执行这个操作",
     "not_available": "当前暂时无法使用这个功能",
     "configuration_error": "当前功能的权限配置尚未准备好",
@@ -36,7 +37,7 @@ class ToolError(Exception):
 
 def result(action, status, **fields):
     return {
-        "ok": status == "success",
+        "ok": status in {"success", "already_saved"},
         "status": status,
         "action": action,
         "message": MESSAGES[status],
@@ -153,7 +154,7 @@ def is_native_event(event):
     ) or _is_owned_reloaded_native_event(event, adapter, WeChatNativeAdapter)
 
 
-def context(event, *, write=False, group=False, send=False):
+def context(event, *, write=False, group=False, send=False, stickers=False, sticker_recovery=False):
     adapter = getattr(event, "adapter", None)
     if not is_native_event(event):
         if not isinstance(event, WeChatNativeEvent):
@@ -168,12 +169,16 @@ def context(event, *, write=False, group=False, send=False):
         raise ToolError("not_available", "adapter_type_mismatch")
     raw = event.message_obj.raw_message
     cfg = adapter.native_config
+    if stickers and (
+        not cfg.enable_stickers or adapter._events.get(event.message_obj.message_id) is not event
+    ):
+        raise ToolError("not_available", "stickers_disabled_or_unowned_event")
     enabled = cfg.enable_wechat_actions if write else cfg.enable_history_tools
     if adapter.stopped or adapter._state_closed:
         raise ToolError("not_available", "adapter_stopped")
     if adapter.client.closed:
         raise ToolError("not_available", "native_client_closed")
-    if not send and not enabled:
+    if not send and not stickers and not enabled:
         raise ToolError(
             "not_available", "wechat_actions_disabled" if write else "history_tools_disabled"
         )
@@ -195,7 +200,17 @@ def context(event, *, write=False, group=False, send=False):
             and event.session.platform_id == adapter.meta().id
             and event.session.session_id == expected_session
             and session_target(event.session.session_id, cfg.account_id) == thread
-            and adapter.state.message_status(raw["id"]) in {"queued", "replied"}
+            and (
+                adapter.state.message_status(raw["id"]) in {"queued", "replied"}
+                or (
+                    stickers
+                    and sticker_recovery
+                    and adapter.state.message_status(raw["id"])
+                    in {"needs_review", "partial", "failed"}
+                    and adapter.state.sticker_operation(cfg.account_id, thread, raw["id"], "send")
+                    is not None
+                )
+            )
             and adapter.state.message_matches(raw["id"], thread, raw.get("serverId"))
         )
     except (ValueError, TypeError, AttributeError):

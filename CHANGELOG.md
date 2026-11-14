@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.15 — 2026-11-14
+
+- Add opt-in Native v2.4.0 quoted sticker previews through AstrBot's existing visual pipeline.
+- Add administrator-requested Saved import with verified original-byte MD5 deduplication, SQLite concurrent claims and strict server/writeback receipts.
+- Add event-bound Saved/added-pack selection and native sticker sends through the existing outbox, loop protection and send lifecycle.
+- Retain fixed idempotency keys and Job IDs; restart recovery only reads original receipts, and unknown outcomes block resubmission.
+- Keep stickers disabled by default. Back up persistent state before upgrade; see `docs/verification-stickers-v2.4.0.md` for verification and real-device acceptance still required.
+
 ## 0.3.14 — 2026-11-13
 
 - Preserve connection status and offline reasons during automatic refresh and post-login checks to prevent panel flicker and layout jumps.

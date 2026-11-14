@@ -43,6 +43,7 @@ from .event import (
     message_timestamp,
     serialize_chain,
     session_target,
+    sticker_preview,
 )
 from .history_tools import HistoryTools
 from .loop_guard import LoopGuard
@@ -59,6 +60,7 @@ from .native_client import (
     load_outgoing_voice,
 )
 from .state import StateStore, cursor_number, state_path
+from .sticker_service import StickerService, quoted_sticker
 from .summary import GroupSummaryCache, is_summary_command
 from .wechat_actions import WeChatActions
 
@@ -150,6 +152,7 @@ class WeChatNativeAdapter(Platform):
         self.loop_guard = LoopGuard(self.state, cfg.account_id)
         self.history = HistoryTools(self)
         self.actions = WeChatActions(self)
+        self.stickers = StickerService(self)
         self._terminate_lock = asyncio.Lock()
         self._last_time_warning = float("-inf")
         self.summary_cache = GroupSummaryCache(cfg.summary_max_messages, cfg.summary_window_minutes)
@@ -241,6 +244,7 @@ class WeChatNativeAdapter(Platform):
         quote = raw.get("quote")
         is_quoted_image = is_quote and isinstance(quote, dict) and quote.get("type") == 3
         is_quoted_voice = is_quote and isinstance(quote, dict) and quote.get("type") == 34
+        is_quoted_sticker = cfg.enable_stickers and quoted_sticker(raw)
         # Native reports the quoted file's title as embeddedText (state is "unsupported").
         is_quoted_pdf = (
             is_quote
@@ -279,6 +283,7 @@ class WeChatNativeAdapter(Platform):
                 or is_quoted_pdf
                 or is_direct_voice
                 or is_quoted_voice
+                or is_quoted_sticker
             ):
                 return "media"
             return "text" if has_text_body else ignored("empty_text_body")
@@ -306,7 +311,9 @@ class WeChatNativeAdapter(Platform):
                 if cfg.group_reply_mode in {"all", "probability"} or mentioned
                 else ignored("voice_without_mention")
             )
-        if cfg.enable_media and (is_quoted_image or is_quoted_pdf or is_quoted_voice):
+        if cfg.enable_media and (
+            is_quoted_image or is_quoted_pdf or is_quoted_voice or is_quoted_sticker
+        ):
             return "media" if mentioned else ignored("quoted_media_without_mention")
         if cfg.group_reply_mode in {"all", "probability"} or mentioned:
             return "text"
@@ -563,7 +570,14 @@ class WeChatNativeAdapter(Platform):
         media_kind = wrapped.get_extra("wechat_native_media_kind") or "image"
         is_pdf = media_kind == "pdf"
         is_voice = media_kind == "voice"
-        label = {"pdf": "PDF", "voice": "语音", "image": "图片", "attachment": "附件"}[media_kind]
+        is_sticker = media_kind == "sticker"
+        label = {
+            "pdf": "PDF",
+            "voice": "语音",
+            "image": "图片",
+            "attachment": "附件",
+            "sticker": "表情",
+        }[media_kind]
         recent_request = wrapped.get_extra("wechat_native_recent_image_request")
 
         def guard() -> None:
@@ -589,7 +603,7 @@ class WeChatNativeAdapter(Platform):
                         else "recent_unavailable",
                         media_kind=media_kind,
                     )
-                if is_quote:
+                if is_quote and not is_sticker:
                     quote = raw.get("quote")
                     if (
                         not isinstance(quote, dict)
@@ -629,7 +643,10 @@ class WeChatNativeAdapter(Platform):
                 image_bytes = pdf_name = pdf_text = voice_bytes = None
                 try:
                     async with asyncio.timeout(self.client.media_timeout):
-                        if is_voice:
+                        if is_sticker:
+                            data, _ = await self.stickers.read_quote(raw, guard=guard)
+                            image_bytes = await asyncio.to_thread(sticker_preview, data)
+                        elif is_voice:
                             if is_quote or recent_request:
                                 voice_bytes = await self._fetch_quote_original(
                                     raw, wrapped, guard, "voice"
@@ -686,6 +703,7 @@ class WeChatNativeAdapter(Platform):
                     image_bytes=image_bytes,
                     pdf_name=pdf_name,
                     voice_bytes=voice_bytes,
+                    sticker=is_sticker,
                 )
                 event = WeChatNativeEvent(enriched, self)
                 event.set_extra("wechat_native_media_kind", media_kind)
@@ -1026,7 +1044,9 @@ class WeChatNativeAdapter(Platform):
                 "wechat_native_media_kind",
                 recent_kind
                 or (
-                    "voice"
+                    "sticker"
+                    if self.native_config.enable_stickers and quoted_sticker(raw)
+                    else "voice"
                     if raw.get("type") == 34
                     or (isinstance(quote, dict) and quote.get("type") == 34)
                     else "pdf"
@@ -1075,6 +1095,10 @@ class WeChatNativeAdapter(Platform):
                         recovery = asyncio.create_task(self.actions.recover())
                         self.actions.tasks.add(recovery)
                         recovery.add_done_callback(self.actions.tasks.discard)
+                        if self.native_config.enable_stickers:
+                            sticker_recovery = asyncio.create_task(self.stickers.recover())
+                            self.actions.tasks.add(sticker_recovery)
+                            sticker_recovery.add_done_callback(self.actions.tasks.discard)
                     if not account.get("authenticated") or account.get("connection") != "online":
                         logger.warning("WeChat Native 账号尚未在线；等待 Native 恢复连接")
                     async for event in self.client.events(self.state.cursor):
@@ -1104,7 +1128,16 @@ class WeChatNativeAdapter(Platform):
             if self.admin_client:
                 await self.admin_client.close()
 
-    async def send_chain(self, thread: str, chain, *, source=None, event=None) -> bool:
+    async def send_chain(
+        self,
+        thread: str,
+        chain,
+        *,
+        source=None,
+        event=None,
+        sticker=None,
+        sticker_key=None,
+    ) -> bool:
         if self.stopped:
             raise RuntimeError("WeChat Native 已停止")
         task = asyncio.current_task()
@@ -1117,12 +1150,27 @@ class WeChatNativeAdapter(Platform):
                     if event:
                         event.stop_event()
                     return False
-                return await self._send_chain(thread, chain, source=source, event=event)
+                return await self._send_chain(
+                    thread,
+                    chain,
+                    source=source,
+                    event=event,
+                    sticker=sticker,
+                    sticker_key=sticker_key,
+                )
         finally:
             self._send_tasks.discard(task)
 
     async def _send_chain(
-        self, thread: str, chain, *, source=None, event=None, red_packet: bool = False
+        self,
+        thread: str,
+        chain,
+        *,
+        source=None,
+        event=None,
+        red_packet: bool = False,
+        sticker=None,
+        sticker_key=None,
     ) -> bool:
         if self.stopped:
             raise RuntimeError("WeChat Native 已停止")
@@ -1135,9 +1183,12 @@ class WeChatNativeAdapter(Platform):
                 if event and event.get_extra("wechat_native_quote_invalidated"):
                     event.stop_event()
                     return False
-                parts, mentions, reply_id = serialize_chain(
-                    chain, group=thread.endswith("@chatroom")
-                )
+                if sticker is not None:
+                    parts, mentions, reply_id = [sticker], None, None
+                else:
+                    parts, mentions, reply_id = serialize_chain(
+                        chain, group=thread.endswith("@chatroom")
+                    )
                 if not parts:
                     return False
                 has_text = any(isinstance(part, str) for part in parts)
@@ -1352,12 +1403,16 @@ class WeChatNativeAdapter(Platform):
                         return bool(index)
                     # Resolve each image with bounded memory, before recording an intent.
                     # No later component is attempted after a failure or unknown outcome.
-                    if not isinstance(part, str):
+                    if not isinstance(part, str) and sticker is None:
                         loader = (
                             load_outgoing_voice if isinstance(part, Record) else load_outgoing_image
                         )
                         data, content_type = await loader(part)
-                    key = "astrbot-" + uuid.uuid4().hex
+                    key = sticker_key if sticker is not None else "astrbot-" + uuid.uuid4().hex
+                    if sticker is not None and (not key or self.state.send_record(key)):
+                        raise ValueError(
+                            "Sticker intent already submitted; inspect its original receipt"
+                        )
                     self.state.begin_send(key, message_id, thread)
 
                     def record_voice_progress(chunks):
@@ -1373,7 +1428,22 @@ class WeChatNativeAdapter(Platform):
                             await check_current_source()
                         if self.loop_guard.blocked(thread):
                             raise ValueError("自动回复已静默停止")
-                        if isinstance(part, str):
+                        if sticker is not None:
+
+                            def record_sticker_job(job_id):
+                                self.state.record_send_id(key, job_id)
+                                self.state.finish_sticker(key, "pending", job_id)
+
+                            receipt = await self.client.send_sticker(
+                                thread,
+                                sticker,
+                                key,
+                                record_job=record_sticker_job,
+                            )
+                            self.state.complete_sticker_send(
+                                key, receipt["id"], receipt["serverMessageId"]
+                            )
+                        elif isinstance(part, str):
                             receipt = await self.client.send_text(
                                 thread, part, key, mentions, quote=quote
                             )
@@ -1432,7 +1502,8 @@ class WeChatNativeAdapter(Platform):
                                 key,
                             )
                         raise
-                    self.state.finish_send(key, "accepted", receipt["id"])
+                    if sticker is None:
+                        self.state.finish_send(key, "accepted", receipt["id"])
                     self.loop_guard.outgoing(
                         thread,
                         key,

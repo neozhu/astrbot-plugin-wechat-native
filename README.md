@@ -3,7 +3,7 @@
 让 AstrBot 接入个人微信，在私聊和群聊中使用模型、语音与插件能力。
 插件通过 **agent-wechat-native /v1 API** 连接微信，运行于 AstrBot 内，无需额外 Bridge 服务。
 
-**适配版本：** AstrBot `>=4.29.3,<5` · Native `v2.3.0` · Python `3.12+`
+**适配版本：** AstrBot `>=4.29.3,<5` · Native `v2.4.0` · Python `3.12+`
 
 [功能概览](#功能概览) · [安装与配置](#安装与配置) · [Docker 部署](#docker-部署同一台-linux-主机) · [常见问题](#常见问题) · [详细用法](docs/features.md)
 
@@ -15,6 +15,9 @@
 
 图片识别需视觉模型；语音识别与合成需分别配置 STT、TTS。支持 AstrBot 文本转图片，普通文件发送暂不支持。
 查看[图片发送](docs/features.md#支持发送图片)、[媒体读取指令](docs/features.md#图片识别)、[语音收发](docs/features.md#微信语音收发)与[引用回复](docs/features.md#消息引用回复)。
+
+v0.3.15 增加默认关闭的[原生表情功能](docs/features.md#原生表情native-v240)：
+读取引用表情、按管理员明确请求去重收藏，以及从 Saved/已添加官方表情包发送原生表情。
 
 ### 群聊协作与运行保障
 
@@ -88,6 +91,7 @@ Native Token 需要目标账号的 **read + send + media** 权限。本文 Compo
 | --- | --- | --- |
 | `enable_private_reply` | `true` | 是否回复私聊 |
 | `enable_media` | `true` | 启用图片、PDF 与语音接收；群聊支持引用媒体 + @提问，或先发送再 @并使用读取指令 |
+| `enable_stickers` | `false` | 开启原生表情工具；引用读取还需 `enable_media`；收藏只允许 `wechat_action_admins` 中的用户明确请求 |
 | `allowed_users` | `[]` | 私聊 senderId 白名单；空列表允许所有人，不限制群成员 |
 | `group_reply_mode` | `mention` | `mention`：真正 @机器人；`all`：全部群文本与直接语音都直接唤醒；`probability`：全部进入 AstrBot，但只有 @ 唤醒，其余交给 AstrBot 的主动回复概率；`disabled`：不回复群聊 |
 | `group_reply_style` | `mention` | 群聊回复方式：`mention` @触发者；`quote` 引用触发消息；`plain` 直接发送 |
@@ -245,7 +249,7 @@ services:
         max-file: "3"
 
   agent-wechat:
-    image: ghcr.io/thisnick/agent-wechat-native:v2.3.0
+    image: ghcr.io/thisnick/agent-wechat-native:v2.4.0
     container_name: agent-wechat
     restart: unless-stopped
     network_mode: host

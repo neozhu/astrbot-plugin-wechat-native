@@ -926,8 +926,52 @@ class NativeClient:
             "GET", self.prefix + "/messages/" + quote(message_id, safe="") + "/media"
         )
 
+    async def sticker_assets(self, message_id: str) -> list[dict]:
+        return await self._load_assets(message_id, "sticker", quoted=True)
+
+    async def sticker_content(self, asset: dict, *, original=False) -> bytes:
+        """Read only authenticated Native content, verifying its advertised identity."""
+        if asset.get("state") != "available":
+            reason = {
+                "expired": "expired",
+                "unsupported": "unsupported_format",
+                "recalled": "recalled",
+            }.get(asset.get("state"), "unavailable")
+            raise MediaError(reason)
+        preview = asset.get("preview")
+        use_preview = not original and isinstance(preview, dict)
+        if use_preview and preview.get("sourceSha256") != asset.get("sha256"):
+            raise MediaError("unavailable")
+        metadata = preview if use_preview else asset
+        if original and (
+            asset.get("variant") != "original"
+            or _effective_variant(asset) != "original"
+            or asset.get("contentType") == "image/x-wxgf"
+        ):
+            raise MediaError("unsupported_format")
+        size, sha = metadata.get("byteLength"), metadata.get("sha256")
+        if (
+            type(size) is not int
+            or size <= 0
+            or not isinstance(sha, str)
+            or not re.fullmatch(r"[0-9a-fA-F]{64}", sha)
+        ):
+            raise MediaError("unavailable")
+        if size > MAX_IMAGE_BYTES:
+            raise MediaError("too_large")
+        data, _ = await self.media_content(asset["id"], preview=use_preview)
+        if len(data) != size or hashlib.sha256(data).hexdigest() != sha.lower():
+            raise MediaError("unavailable")
+        validate_image_bytes(data)
+        return data
+
     async def transfer_media(
-        self, message_id: str, quality: str = "original", *, asset_id: str | None = None
+        self,
+        message_id: str,
+        quality: str = "original",
+        *,
+        asset_id: str | None = None,
+        key: str | None = None,
     ) -> dict:
         logger.debug(
             "WeChat Native 请求媒体传输：message=%s quality=%s asset=%s",
@@ -943,6 +987,7 @@ class NativeClient:
                 "POST",
                 self.prefix + "/messages/" + quote(message_id, safe="") + "/media-transfers",
                 json=payload,
+                **({"headers": {"Idempotency-Key": key}} if key else {}),
             )
         except NativeAPIError as error:
             logger.warning(
@@ -955,6 +1000,28 @@ class NativeClient:
 
     async def job(self, job_id: str) -> dict:
         return await self._request("GET", self.prefix + "/jobs/" + quote(job_id, safe=""))
+
+    async def custom_stickers(self):
+        return await self._request("GET", self.prefix + "/custom-stickers")
+
+    async def sticker_packs(self):
+        return await self._request(
+            "GET", self.prefix + "/sticker-packs", params={"membership": "added"}
+        )
+
+    async def pack_stickers(self, pack_id):
+        return await self._request(
+            "GET", self.prefix + "/sticker-packs/" + quote(pack_id, safe="") + "/stickers"
+        )
+
+    async def save_sticker(self, message_id, asset_id, key):
+        return await self._request(
+            "POST",
+            self.prefix + "/custom-stickers",
+            json={"source": {"kind": "message", "messageId": message_id, "assetId": asset_id}},
+            headers={"Idempotency-Key": key},
+            expected_status=202,
+        )
 
     async def media_content(
         self,
@@ -1669,6 +1736,60 @@ class NativeClient:
                 return await self.send_by_key(key)
             except NativeAPIError:
                 raise SendError("submission_unknown", key) from None
+
+    async def send_sticker(self, thread, source, key, *, record_job):
+        value = await self._submit_send(
+            {"kind": "sticker", "threadId": thread, "source": source}, key
+        )
+        return await self.sticker_send_receipt(thread, key, initial=value, record_job=record_job)
+
+    async def sticker_send_receipt(
+        self, thread, key, *, initial=None, job_id=None, record_job=None
+    ):
+        """Sticker jobs use available/accepted receipts, unlike image/voice jobs."""
+        value = initial
+        deadline = asyncio.get_running_loop().time() + self.send_timeout
+        try:
+            async with asyncio.timeout(self.send_timeout):
+                while True:
+                    if value is None:
+                        value = await self.job(job_id) if job_id else await self.send_by_key(key)
+                    if (
+                        not isinstance(value.get("id"), str)
+                        or not value["id"]
+                        or (job_id and value["id"] != job_id)
+                        or value.get("kind") != "sticker_send"
+                        or value.get("accountId") != self.account_id
+                        or value.get("threadId") != thread
+                    ):
+                        raise SendError("needs_review", key, job_id)
+                    job_id = value["id"]
+                    if record_job:
+                        record_job(job_id)
+                    payload = value.get("result")
+                    payload = payload if isinstance(payload, dict) else {}
+                    server_id = value.get("serverMessageId")
+                    if (
+                        value.get("state") == "available"
+                        and payload.get("serverAcceptance") == "accepted"
+                        and isinstance(server_id, str)
+                        and server_id.strip()
+                        and len(server_id) <= 128
+                        and (payload.get("serverMessageId") in {None, server_id})
+                    ):
+                        return value
+                    if value.get("state") in {"failed", "cancelled"} and payload.get(
+                        "serverAcceptance"
+                    ) in {"not_attempted", "rejected"}:
+                        raise SendError("failed", key, job_id)
+                    if value.get("state") not in {"queued", "running"}:
+                        raise SendError("needs_review", key, job_id)
+                    if asyncio.get_running_loop().time() >= deadline:
+                        raise SendError("needs_review", key, job_id)
+                    await asyncio.sleep(self.poll_interval)
+                    value = None
+        except (NativeAPIError, TimeoutError):
+            raise SendError("needs_review", key, job_id) from None
 
     async def send_image(
         self,

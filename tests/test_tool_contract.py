@@ -15,6 +15,9 @@ TOOLS = {
     "wechat_rename_group": {"name"},
     "wechat_recall_own_message": {"message_id"},
     "wechat_mention_member": {"username", "text"},
+    "wechat_save_quoted_sticker": set(),
+    "wechat_find_stickers": {"query", "limit"},
+    "wechat_send_sticker": {"selection_id"},
 }
 
 
@@ -29,7 +32,9 @@ def test_real_astrbot_registry_exposes_scoped_tools():
         signature = inspect.signature(getattr(plugin, name))
         assert set(signature.parameters) - {"self", "event"} == params
         if "limit" in params:
-            assert signature.parameters["limit"].default == 20
+            assert signature.parameters["limit"].default == (
+                12 if name == "wechat_find_stickers" else 20
+            )
         if "cursor" in params:
             assert signature.parameters["cursor"].default == ""
         assert signature.return_annotation is str
@@ -47,6 +52,9 @@ def test_real_astrbot_registry_exposes_scoped_tools():
         ("wechat_set_my_group_nickname", {"nickname": "new"}),
         ("wechat_rename_group", {"name": "new"}),
         ("wechat_recall_own_message", {}),
+        ("wechat_save_quoted_sticker", {}),
+        ("wechat_find_stickers", {}),
+        ("wechat_send_sticker", {"selection_id": "untrusted"}),
     ],
 )
 async def test_disabled_and_foreign_tools_make_no_http(serve, tmp_path, name, params):
@@ -107,6 +115,7 @@ async def test_group_subsessions_cannot_expand_history_scope(serve, tmp_path, un
     "option,value",
     [
         ("enable_history_tools", 1),
+        ("enable_stickers", 1),
         ("enable_wechat_actions", "yes"),
         ("wechat_action_admins", "all"),
         ("wechat_action_admins", [None]),
