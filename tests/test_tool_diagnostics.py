@@ -419,8 +419,21 @@ async def test_missing_receipt_reclaim_keeps_concurrent_callers_single_post(serv
         await adapter.terminate()
 
 
+@pytest.mark.parametrize(
+    ("fault_fields", "expected_code"),
+    [
+        (
+            {"error": {"code": "media_not_available", "message": "synthetic-secret"}},
+            "media_not_available",
+        ),
+        (
+            {"reason": "media_service_rejected", "message": "synthetic-secret"},
+            "media_service_rejected",
+        ),
+    ],
+)
 async def test_failed_acquisition_job_logs_nested_error_code_and_returns_failed(
-    serve, tmp_path, caplog
+    serve, tmp_path, caplog, fault_fields, expected_code
 ):
     from test_stickers import deliver, send_sticker
 
@@ -434,7 +447,7 @@ async def test_failed_acquisition_job_logs_nested_error_code_and_returns_failed(
             value.update(
                 state="failed",
                 phase="downloading",
-                error={"code": "media_not_available", "message": "synthetic-secret"},
+                **fault_fields,
             )
             value["result"] = {"serverAcceptance": "accepted"}
         return value
@@ -446,8 +459,8 @@ async def test_failed_acquisition_job_logs_nested_error_code_and_returns_failed(
         assert outcome["status"] == "not_available"
         assert outcome["reason"] == "sticker_acquisition_failed"
         assert (
-            "native_state=failed native_phase=downloading "
-            "native_code=media_not_available acceptance=accepted"
+            f"native_state=failed native_phase=downloading "
+            f"native_code={expected_code} acceptance=accepted"
         ) in caplog.text
         assert "synthetic-secret" not in caplog.text
 

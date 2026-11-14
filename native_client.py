@@ -88,6 +88,7 @@ _SAFE_CODES = {
     "custom_sticker_not_found",
     "unsupported_sticker_send_format",
     "media_queue_full",
+    "media_service_rejected",
     "sticker_submission_needs_review",
     "sticker_pack_not_eligible",
     "sticker_pack_item_not_found",
