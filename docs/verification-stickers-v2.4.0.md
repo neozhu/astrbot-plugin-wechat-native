@@ -47,6 +47,27 @@ stale-selection-red.txt：2 failed；stale-selection-green.txt：111 passed（�
 stale-selection-full.txt：全量 **900 passed**，67.56秒；静态、格式、编译和差异检查通过。
 真实微信发送成功仍待本次改动后的手机验收。
 
+11:23 实机查询已返回 Saved=1、已添加包=2、候选=49，并在同一触发消息中找到“一二/哈哈”。
+这次已进入发送入口，不能再归因于候选过期。核对 Native v2.4.0 `sticker_send.rs` 后确认：
+Saved 可以在发送 Job 内按需获取 GIF；pack 来源缺少索引原图时直接拒绝
+`sticker_source_unavailable`。此前把两者混为一谈，遗漏了 SPEC 的官方包单项获取。
+日志本身未保留 Native 错误码，因此不能断言该条历史回执的具体拒绝原因。
+
+- 官方包缺少原图时，固定 `packId + stickerId` 和幂等键提交一次 `/sticker-downloads`。
+  SQLite 保存 `sticker_acquire` Job ID，再次调用、并发、跨消息和重启只核对原获取操作。
+  获取完成后重新验证账号、包成员资格、原始 GIF 元数据及当前触发消息，再复用既有发送链路。
+  获取失败或未知时不提交 `/sends`；恢复任务也不会自动补发此前未提交的表情。
+- 已明确失败的发送在操作表/outbox 中均为 failed，不再误报 needs_review；
+  记录经过白名单过滤的 HTTP/code，允许另发失败说明。同一 Sticker 意图仍不能重提。
+  未知发送保留 needs_review 并静默停止后续回复，不再触发日志中的二次 TTS 发送异常。
+- TDD：send-failure-red.txt（2 failed）→send-failure-green.txt（2 passed）；
+  pack-acquisition-red.txt（12 failed）→pack-acquisition-green.txt（12 passed）；
+  pack-acquisition-regression.txt（95 passed，含取消/只读恢复和跨连接获取去重）。
+
+本轮升级必须完整重启 AstrBot 进程/容器，让已有 NativeClient 加载新增的获取接口。
+版本号仍为 v0.3.15，保留原状态库；历史未知请求不重提。发送一条新测试消息：
+“找一个‘哈哈’表情包并发送”，手机确认原生表情显示后才算官方包发送验收通过。
+
 修改前工作区干净，`main` 为 `2188fc7`；与 `origin/main` (`95b132f`) 的差异只有 SPEC 文档。
 已在修改前阅读六个指定实现文件，并核对 Native v2.4.0 的官方 OpenAPI 和服务端实现。
 
@@ -85,7 +106,7 @@ stale-selection-full.txt：全量 **900 passed**，67.56秒；静态、格式、
 | C1 Saved 查询 | `test_catalog_is_bounded_metadata_only_and_selection_is_event_bound` |
 | C2 已添加官方包 | 同上；`test_membership_removed_after_find_prevents_post[pack]` |
 | C3 saved 来源原生发送 | `test_native_send_reuses_outbox_and_sends_one_selected_original[saved]` |
-| C4 pack 来源及单项按需获取 | 同上 `[pack]`，原图缺失仍提交该单项 Native send Job，不下载整包 |
+| C4 pack 来源及单项按需获取 | `test_missing_pack_original_acquires_only_selected_item_before_send`；获取失败/未知、元数据不符、权限变化均无发送 POST |
 | C5 严格成功回执 | `test_unconfirmed_send_never_reports_success_or_submits_twice` 六种故障；原子回执测试 |
 | C6 重复工具/断线/未知结果 | 同上；并发发送、重启恢复、延迟确认循环保护测试 |
 | D1 默认关闭兼容 | `test_sticker_switches_and_existing_access_policy`、工具默认关闭零 HTTP 测试 |
@@ -137,6 +158,7 @@ TDD 每阶段的失败、实现和通过记录见[实施计划证据表](superpo
    保留原 `server_url`、`account_id` 与机器人 ID，避免切换到另一份空状态库。
 2. 将 Native 镜像升级为 `ghcr.io/thisnick/agent-wechat-native:v2.4.0`，确认账号在线。
 3. 更新插件的 `main` 分支代码并重启机器人；测试期间版本号保持 v0.3.15。
+   本轮新增 NativeClient 单项获取方法，需完整重启 AstrBot 进程/容器，不能仅热重载插件。
    已部署 v0.3.15 的依赖不变，Python 3.12+、AstrBot 版本范围不变。
 4. 沿用 `token_file` 的目标账号 `read + media + send` scopes；无需额外 Admin Token。
    收藏不需要配置 `wechat_action_admins`；该名单继续控制原有群改名和撤回工具。
@@ -166,3 +188,4 @@ TDD 每阶段的失败、实现和通过记录见[实施计划证据表](superpo
 - [OpenAPI](https://github.com/thisnick/agent-wechat/blob/v2.4.0/interfaces/http/openapi.json)
 - [收藏 Job](https://github.com/thisnick/agent-wechat/blob/v2.4.0/packages/native-client-rust/crates/wechat-core/src/sticker_jobs.rs)
 - [原生发送及单项获取](https://github.com/thisnick/agent-wechat/blob/v2.4.0/packages/native-client-rust/crates/wechat-core/src/sticker_send.rs)
+- [官方包单项获取 Job](https://github.com/thisnick/agent-wechat/blob/v2.4.0/packages/native-client-rust/crates/wechat-core/src/sticker_pack_download.rs)

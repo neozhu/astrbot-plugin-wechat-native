@@ -135,6 +135,10 @@ class StateStore:
             CREATE UNIQUE INDEX IF NOT EXISTS sticker_save_inflight
                 ON sticker_operations(account, content_id)
                 WHERE action='save' AND state IN ('pending','submitting','needs_review');
+            CREATE UNIQUE INDEX IF NOT EXISTS sticker_acquire_inflight
+                ON sticker_operations(account, action, content_id)
+                WHERE action LIKE 'acquire:%'
+                    AND state IN ('pending','submitting','needs_review');
         """)
         with self.db:
             self.db.execute(
@@ -189,11 +193,11 @@ class StateStore:
             existing = self.sticker_operation(account, thread, trigger, action)
             if existing:
                 return existing, False
-            if action == "save":
+            if action == "save" or action.startswith("acquire:"):
                 existing = self.db.execute(
                     "SELECT * FROM sticker_operations WHERE account=? AND content_id=? "
-                    "AND action='save' AND state IN ('pending','submitting','needs_review')",
-                    (account, content_id),
+                    "AND action=? AND state IN ('pending','submitting','needs_review')",
+                    (account, content_id, action),
                 ).fetchone()
                 if existing:
                     return dict(existing), False

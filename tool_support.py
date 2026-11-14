@@ -40,6 +40,11 @@ STICKER_ERROR_MESSAGES = {
         "表情候选来自之前的消息或已过期，尚未提交发送。"
         "请在当前请求中重新查找候选，再发送新的 selection_id。"
     ),
+    "sticker_acquisition_failed": "选中表情的原始资源获取失败，尚未提交表情发送。",
+    "sticker_acquisition_needs_review": (
+        "选中表情的资源获取结果尚未确认，尚未提交表情发送；保留原回执，不重复获取。"
+    ),
+    "sticker_pack_original_unavailable": "选中表情尚无可验证的原始 GIF，尚未提交表情发送。",
 }
 
 

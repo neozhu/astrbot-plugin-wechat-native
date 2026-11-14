@@ -61,12 +61,15 @@ class Native:
         self.acceptance = "accepted"
         self.writeback = "complete"
         self.post_status = 202
+        self.post_error_code = "request_failed"
         self.last_kind = "sticker_saved"
         self.content_requests = []
         self.native_version = "2.4.0"
+        self.acquire_polls = 0
+        self.acquire_fault = None
 
     def job(self, kind="sticker_saved", job_id="job1"):
-        return {
+        value = {
             "id": job_id,
             "accountId": "a",
             "kind": kind,
@@ -80,6 +83,34 @@ class Native:
                 "profileWriteback": self.writeback,
             },
         }
+        if kind == "sticker_acquire":
+            value["result"].update(
+                packId="pack1",
+                contentReadiness="available",
+                items=[dict(self.asset, id="pack-original", messageId=None)],
+            )
+            if self.acquire_polls:
+                self.acquire_polls -= 1
+                value.update(
+                    state="running", phase="downloading", result={"serverAcceptance": "pending"}
+                )
+            elif self.acquire_fault == "failed":
+                value.update(state="failed", result={"serverAcceptance": "rejected"})
+            else:
+                self.pack_items[0]["original"] = dict(
+                    self.asset, id="pack-original", messageId=None
+                )
+                if self.acquire_fault == "missing_original":
+                    self.pack_items[0]["original"] = None
+                elif self.acquire_fault == "foreign_original":
+                    self.pack_items[0]["original"]["accountId"] = "other"
+                elif self.acquire_fault == "not_gif":
+                    self.pack_items[0]["original"]["contentType"] = "image/png"
+                elif self.acquire_fault == "foreign_job":
+                    value["accountId"] = "other"
+                elif self.acquire_fault == "wrong_pack":
+                    value["result"]["packId"] = "other"
+        return value
 
     async def handle(self, req):
         body = await req.json() if req.method == "POST" else None
@@ -88,13 +119,27 @@ class Native:
         if path.endswith("/status"):
             return web.json_response({"version": {"version": self.native_version}})
         if req.method == "POST":
+            if path.endswith("/sends") and "text" in body:
+                return web.json_response(
+                    {
+                        "id": "notice1",
+                        "accountId": "a",
+                        "destination": self.raw["threadId"],
+                        "state": "accepted",
+                        "serverId": "1000",
+                    }
+                )
             if self.post_status != 202:
-                return web.json_response({}, status=self.post_status)
+                return web.json_response(
+                    {"error": {"code": self.post_error_code}}, status=self.post_status
+                )
             kind = (
                 "download"
                 if path.endswith("media-transfers")
                 else "sticker_send"
                 if path.endswith("/sends")
+                else "sticker_acquire"
+                if path.endswith("/sticker-downloads")
                 else "sticker_saved"
             )
             self.last_kind = kind
@@ -352,7 +397,14 @@ async def send_event(serve, tmp_path, **options):
     native, adapter = await setup(serve, tmp_path, message(), **options)
     native.saved = [{"id": CONTENT_ID, "caption": "开心", "original": None}]
     native.packs = [{"id": "pack1", "name": "小猫", "membership": "added"}]
-    native.pack_items = [{"id": "b" * 32, "packId": "pack1", "caption": "晚安", "original": None}]
+    native.pack_items = [
+        {
+            "id": "b" * 32,
+            "packId": "pack1",
+            "caption": "晚安",
+            "original": dict(native.asset, id="pack-original", messageId=None),
+        }
+    ]
     return native, adapter, await deliver(adapter, native.raw)
 
 
@@ -1060,3 +1112,220 @@ async def test_unknown_send_is_inspected_even_when_model_reuses_another_selectio
         assert len([c for c in native.calls if c[0] == "POST"]) == 1
     finally:
         await adapter.terminate()
+
+
+async def test_confirmed_sticker_rejection_stays_failed_and_allows_failure_notice(serve, tmp_path):
+    from astrbot.api.event import MessageChain
+    from astrbot.api.message_components import Plain
+
+    native, adapter, event = await send_event(serve, tmp_path)
+    native.post_status = 400
+    native.post_error_code = "sticker_source_unavailable"
+    try:
+        selection = (await find(event))["items"][0]["selection_id"]
+        data = await send_sticker(event, selection)
+        assert data["status"] == "failed"
+        assert data["reason"] == "sticker_source_unavailable"
+        row = adapter.state.sticker_operation("a", "peer", "m1", "send")
+        assert (
+            row["state"] == adapter.state.send_record(row["idempotency_key"])["state"] == "failed"
+        )
+        assert adapter.state.message_status("m1") == "queued"
+        assert await adapter.send_chain(
+            "peer", MessageChain([Plain("原图不可用，未发送表情")]), source=native.raw, event=event
+        )
+        assert (await send_sticker(event, selection))["status"] == "failed"
+        assert (
+            len([c for c in native.calls if c[0] == "POST" and c[2].get("kind") == "sticker"]) == 1
+        )
+        assert len([c for c in native.calls if c[0] == "POST" and "text" in c[2]]) == 1
+    finally:
+        await adapter.terminate()
+
+
+async def test_unknown_sticker_outcome_suppresses_followup_without_another_post(serve, tmp_path):
+    from astrbot.api.event import MessageChain
+    from astrbot.api.message_components import Plain
+
+    native, adapter, event = await send_event(serve, tmp_path)
+    native.post_status = 503
+    try:
+        selection = (await find(event))["items"][0]["selection_id"]
+        assert (await send_sticker(event, selection))["status"] == "needs_review"
+        await event.send(MessageChain([Plain("结果待核对")]))
+        assert event.is_stopped()
+        assert adapter.state.message_status("m1") == "needs_review"
+        assert len([c for c in native.calls if c[0] == "POST"]) == 1
+    finally:
+        await adapter.terminate()
+
+
+async def test_missing_pack_original_acquires_only_selected_item_before_send(serve, tmp_path):
+    native, adapter, event = await send_event(serve, tmp_path)
+    native.pack_items[0]["original"] = None
+    native.acquire_polls = 1
+    adapter.client.poll_interval = 0.001
+    real_job = adapter.client.job
+
+    async def job(job_id):
+        row = adapter.state.sticker_operation("a", "peer", "m1", "acquire:pack1")
+        assert row["job_id"] == job_id and row["state"] == "pending"
+        return await real_job(job_id)
+
+    adapter.client.job = job
+    try:
+        choice = (await find(event, "晚安"))["items"][0]["selection_id"]
+        assert not any(c[0] == "POST" for c in native.calls)
+        assert (await send_sticker(event, choice))["status"] == "success"
+        assert (await send_sticker(event, choice))["status"] == "success"
+        posts = [c for c in native.calls if c[0] == "POST"]
+        assert len(posts) == 2
+        assert posts[0][1].endswith("/sticker-downloads")
+        assert posts[0][2] == {"packId": "pack1", "stickerId": "b" * 32}
+        acquisition = adapter.state.sticker_operation("a", "peer", "m1", "acquire:pack1")
+        assert acquisition["state"] == "success" and acquisition["job_id"] == "job1"
+        assert posts[0][3] == acquisition["idempotency_key"]
+        assert posts[1][1].endswith("/sends") and posts[1][2]["source"]["kind"] == "pack"
+        assert posts[0][3] != posts[1][3]
+    finally:
+        await adapter.terminate()
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "failed",
+        "missing_original",
+        "foreign_original",
+        "not_gif",
+        "foreign_job",
+        "wrong_pack",
+        "lost",
+        "timeout",
+    ],
+)
+async def test_unready_pack_never_submits_send_or_reposts_unknown_acquisition(
+    serve, tmp_path, fault
+):
+    native, adapter, event = await send_event(serve, tmp_path)
+    native.pack_items[0]["original"] = None
+    native.acquire_fault = fault
+    if fault == "lost":
+        native.post_status = 503
+    if fault == "timeout":
+        native.acquire_polls = 1000
+    adapter.client.media_timeout = 0.03
+    adapter.client.poll_interval = 0.001
+    try:
+        choice = (await find(event, "晚安"))["items"][0]["selection_id"]
+        data = await send_sticker(event, choice)
+        assert data["status"] == "not_available"
+        assert data["reason"].startswith("sticker_")
+        await send_sticker(event, choice)
+        posts = [c for c in native.calls if c[0] == "POST"]
+        assert len(posts) == 1 and posts[0][1].endswith("/sticker-downloads")
+        row = adapter.state.sticker_operation("a", "peer", "m1", "send")
+        assert adapter.state.send_record(row["idempotency_key"]) is None
+        assert row["state"] == "failed"  # No send was submitted.
+        if fault in {"lost", "timeout"}:
+            cfg = dict(adapter.config)
+            await adapter.terminate()
+            adapter = module("adapter").WeChatNativeAdapter(
+                cfg, {}, asyncio.Queue(), state_dir=tmp_path
+            )
+            adapter.bot_self_id = "bot"
+            await adapter.client.open()
+            adapter.client.media_timeout = 0.03
+            adapter.client.poll_interval = 0.001
+            await adapter.stickers.recover()
+            native.raw = dict(native.raw, id="m2", serverId="901")
+            event = await deliver(adapter, native.raw)
+            choice = (await find(event, "晚安"))["items"][0]["selection_id"]
+            assert (await send_sticker(event, choice))["status"] == "not_available"
+            assert len([c for c in native.calls if c[0] == "POST"]) == 1
+    finally:
+        await adapter.terminate()
+
+
+@pytest.mark.parametrize("change", ["membership", "disabled", "recalled"])
+async def test_pack_acquisition_rechecks_authority_before_send(serve, tmp_path, change):
+    native, adapter, event = await send_event(serve, tmp_path)
+    native.pack_items[0]["original"] = None
+    original_download = native.job
+
+    def job(kind="sticker_saved", job_id="job1"):
+        data = original_download(kind, job_id)
+        if kind == "sticker_acquire":
+            if change == "membership":
+                native.packs[0]["membership"] = "not_added"
+            elif change == "disabled":
+                adapter.native_config.enable_stickers = False
+            else:
+                native.raw["recall"] = {"state": "recalled"}
+        return data
+
+    native.job = job
+    try:
+        choice = (await find(event, "晚安"))["items"][0]["selection_id"]
+        assert not (await send_sticker(event, choice))["ok"]
+        posts = [c for c in native.calls if c[0] == "POST"]
+        assert len(posts) == 1 and posts[0][1].endswith("/sticker-downloads")
+    finally:
+        await adapter.terminate()
+
+
+async def test_pack_acquisition_cancellation_retains_job_and_recovery_never_sends(serve, tmp_path):
+    native, adapter, event = await send_event(serve, tmp_path)
+    native.pack_items[0]["original"] = None
+    native.acquire_polls = 1
+    entered = asyncio.Event()
+    real_job = adapter.client.job
+
+    async def waiting(job_id):
+        entered.set()
+        await asyncio.Future()
+
+    adapter.client.job = waiting
+    adapter.client.poll_interval = 0.001
+    try:
+        choice = (await find(event, "晚安"))["items"][0]["selection_id"]
+        task = asyncio.create_task(send_sticker(event, choice))
+        await asyncio.wait_for(entered.wait(), 1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        row = adapter.state.sticker_operation("a", "peer", "m1", "acquire:pack1")
+        assert row["state"] == "needs_review" and row["job_id"] == "job1"
+        adapter.client.job = real_job
+        await adapter.stickers.recover()
+        assert (
+            adapter.state.sticker_operation("a", "peer", "m1", "acquire:pack1")["state"]
+            == "success"
+        )
+        assert len([c for c in native.calls if c[0] == "POST"]) == 1
+        assert not (await send_sticker(event, choice))["ok"]
+        assert not any(c[0] == "POST" and c[1].endswith("/sends") for c in native.calls)
+    finally:
+        await adapter.terminate()
+
+
+def test_pack_acquisition_claim_deduplicates_unknown_item_across_connections(tmp_path):
+    State = module("state").StateStore
+    first, second = State(tmp_path / "shared.sqlite3"), State(tmp_path / "shared.sqlite3")
+    try:
+        row, won = first.claim_sticker(
+            "a", "peer1", "m1", "acquire:pack1", "b" * 32, "key1", "hash", 10
+        )
+        assert won
+        first.finish_sticker("key1", "needs_review", "job1")
+        retained, won = second.claim_sticker(
+            "a", "peer2", "m2", "acquire:pack1", "b" * 32, "key2", "hash", 20
+        )
+        assert not won and retained["idempotency_key"] == row["idempotency_key"]
+        assert retained["job_id"] == "job1"
+        assert second.claim_sticker(
+            "a", "peer2", "m2", "acquire:pack2", "b" * 32, "key3", "hash", 20
+        )[1]
+    finally:
+        first.close()
+        second.close()

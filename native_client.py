@@ -83,6 +83,10 @@ _SAFE_CODES = {
     "voice_duration_limit",
     "media_audio_invalid",
     "unsupported_voice_chunk",
+    "sticker_source_unavailable",
+    "sticker_pack_not_added",
+    "custom_sticker_not_found",
+    "unsupported_sticker_send_format",
 }
 
 MEDIA_ERROR_MESSAGES = {
@@ -1019,6 +1023,15 @@ class NativeClient:
             "POST",
             self.prefix + "/custom-stickers",
             json={"source": {"kind": "message", "messageId": message_id, "assetId": asset_id}},
+            headers={"Idempotency-Key": key},
+            expected_status=202,
+        )
+
+    async def download_sticker(self, pack_id, sticker_id, key):
+        return await self._request(
+            "POST",
+            self.prefix + "/sticker-downloads",
+            json={"packId": pack_id, "stickerId": sticker_id},
             headers={"Idempotency-Key": key},
             expected_status=202,
         )

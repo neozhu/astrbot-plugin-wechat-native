@@ -1490,7 +1490,13 @@ class WeChatNativeAdapter(Platform):
                             state = "failed"
                         send_id = error.send_id if isinstance(error, SendError) else None
                         self.state.finish_send(key, state, send_id)
-                        if message_id:
+                        # A confirmed sticker rejection permits a separate failure notice.
+                        # Its retained sticker intent still forbids another sticker POST.
+                        if message_id and not (
+                            sticker is not None
+                            and state == "failed"
+                            and self.state.message_status(message_id) == "queued"
+                        ):
                             self.state.mark_message(
                                 message_id,
                                 "partial"
@@ -1502,6 +1508,13 @@ class WeChatNativeAdapter(Platform):
                                 else state,
                             )
                         if not red_packet:
+                            if sticker is not None and isinstance(error, NativeAPIError):
+                                logger.warning(
+                                    "WeChat Native 表情发送拒绝：http=%s code=%s receipt_key=%s",
+                                    error.status,
+                                    error.code,
+                                    key,
+                                )
                             logger.error(
                                 "WeChat Native 回复未确认；状态 %s，回执键 %s。"
                                 "请检查状态库，勿盲目重发",

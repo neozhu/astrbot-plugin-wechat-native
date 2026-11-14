@@ -252,6 +252,19 @@ class WeChatNativeEvent(AstrMessageEvent):
             self.stop_event()
             return
         if status in {"needs_review", "failed", "partial"}:
+            sticker = (
+                self.adapter.state.sticker_operation(
+                    self.adapter.native_config.account_id,
+                    raw["threadId"],
+                    self.message_obj.message_id,
+                    "send",
+                )
+                if raw and isinstance(raw.get("threadId"), str)
+                else None
+            )
+            if sticker and sticker["state"] in {"submitting", "pending", "needs_review"}:
+                self.stop_event()
+                return
             raise RuntimeError("此消息的回复需人工检查，禁止自动重发")
         try:
             sent = await self.adapter.send_chain(

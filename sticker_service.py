@@ -9,6 +9,7 @@ import uuid
 
 from astrbot.api import logger
 
+from .config import MAX_IMAGE_BYTES
 from .native_client import MediaError, NativeAPIError, SendError
 from .tool_support import ToolError, context, result
 
@@ -221,7 +222,14 @@ class StickerService:
                 if not job_id:
                     return result(action, state)
                 job = await self.adapter.client.job(job_id)
-            expected_kind = "sticker_saved" if action == "save" else "download"
+            acquiring = action.startswith("acquire:")
+            expected_kind = (
+                "sticker_acquire"
+                if acquiring
+                else "sticker_saved"
+                if action == "save"
+                else "download"
+            )
             if (
                 not isinstance(job, dict)
                 or job.get("accountId") != row["account"]
@@ -235,7 +243,16 @@ class StickerService:
             job_id = job["id"]
             payload = job.get("result") or {}
             if job.get("state") == "available" and job.get("phase") == "completed":
-                if action.startswith("transfer:") or (
+                if acquiring:
+                    if (
+                        payload.get("packId") == action.removeprefix("acquire:")
+                        and payload.get("serverAcceptance") == "accepted"
+                        and payload.get("contentReadiness") == "available"
+                        and isinstance(payload.get("items"), list)
+                        and any(self.pack_original_ready(a) for a in payload["items"])
+                    ):
+                        state = "success"
+                elif action.startswith("transfer:") or (
                     payload.get("profileWriteback") == "complete"
                     and payload.get("serverAcceptance") in {"accepted", "reconciled_noop"}
                 ):
@@ -493,10 +510,15 @@ class StickerService:
     async def validate_selection(self, source):
         if source["kind"] == "saved":
             page = await self.adapter.client.custom_stickers()
-            valid = any(
-                isinstance(i, dict) and i.get("id") == source["stickerId"]
-                for i in page.get("items", [])
+            item = next(
+                (
+                    i
+                    for i in page.get("items", [])
+                    if isinstance(i, dict) and i.get("id") == source["stickerId"]
+                ),
+                None,
             )
+            valid = item is not None
         else:
             packs = await self.adapter.client.sticker_packs()
             valid = any(
@@ -507,14 +529,98 @@ class StickerService:
             )
             if valid:
                 page = await self.adapter.client.pack_stickers(source["packId"])
-                valid = page.get("packId") == source["packId"] and any(
-                    isinstance(i, dict)
-                    and i.get("id") == source["stickerId"]
-                    and i.get("packId") == source["packId"]
-                    for i in page.get("items", [])
+                item = next(
+                    (
+                        i
+                        for i in page.get("items", [])
+                        if isinstance(i, dict)
+                        and i.get("id") == source["stickerId"]
+                        and i.get("packId") == source["packId"]
+                    ),
+                    None,
                 )
+                valid = page.get("packId") == source["packId"] and item is not None
         if not valid:
             raise ToolError("not_available", "sticker_membership_changed")
+        return item
+
+    def pack_original_ready(self, asset):
+        return (
+            isinstance(asset, dict)
+            and isinstance(asset.get("id"), str)
+            and bool(asset["id"])
+            and asset.get("accountId") == self.adapter.native_config.account_id
+            and asset.get("messageId") is None
+            and asset.get("kind") == "sticker"
+            and asset.get("variant") == "original"
+            and asset.get("actualVariant") == "original"
+            and asset.get("state") == "available"
+            and asset.get("contentType") == "image/gif"
+            and type(asset.get("byteLength")) is int
+            and 0 < asset["byteLength"] <= MAX_IMAGE_BYTES
+            and isinstance(asset.get("sha256"), str)
+            and re.fullmatch(r"[0-9a-fA-F]{64}", asset["sha256"]) is not None
+        )
+
+    async def prepare_pack(self, event, source, item):
+        original = item.get("original")
+        if isinstance(original, dict) and original.get("state") == "available":
+            if not self.pack_original_ready(original):
+                raise ToolError("not_available", "sticker_pack_original_unavailable")
+            return
+        raw = event.message_obj.raw_message
+        current = await self.adapter.client.message(raw["id"])
+        if current.get("recall") is not None or any(
+            current.get(k) != raw.get(k)
+            for k in ("id", "accountId", "threadId", "serverId", "senderId")
+        ):
+            raise ToolError("not_available")
+        context(event, stickers=True)
+        row, won = self.claim(raw, "acquire:" + source["packId"], source["stickerId"], source)
+        key = row["idempotency_key"]
+        try:
+            async with asyncio.timeout(self.adapter.client.media_timeout):
+                if won:
+                    job = await self.adapter.client.download_sticker(
+                        source["packId"], source["stickerId"], key
+                    )
+                    outcome = await self.inspect(row, job)
+                else:
+                    outcome = await self.inspect(row)
+                while outcome["status"] == "pending":
+                    await asyncio.sleep(self.adapter.client.poll_interval)
+                    row = self.adapter.state.sticker_operation(
+                        row["account"], row["thread"], row["trigger_message_id"], row["action"]
+                    )
+                    outcome = await self.inspect(row)
+                if outcome["status"] != "success":
+                    raise ToolError(
+                        "not_available",
+                        "sticker_acquisition_failed"
+                        if outcome["status"] == "failed"
+                        else "sticker_acquisition_needs_review",
+                    )
+        except BaseException as error:
+            state = (
+                "failed"
+                if isinstance(error, NativeAPIError)
+                and 400 <= error.status < 500
+                and error.status not in {408, 409, 429}
+                else "needs_review"
+            )
+            self.adapter.state.finish_sticker(key, state)
+            if isinstance(error, (asyncio.CancelledError, ToolError)):
+                raise
+            raise ToolError(
+                "not_available",
+                "sticker_acquisition_failed"
+                if state == "failed"
+                else "sticker_acquisition_needs_review",
+            ) from None
+        item = await self.validate_selection(source)
+        if not self.pack_original_ready(item.get("original")):
+            raise ToolError("not_available", "sticker_pack_original_unavailable")
+        context(event, stickers=True)
 
     async def inspect_send(self, row):
         key = row["idempotency_key"]
@@ -552,7 +658,7 @@ class StickerService:
         ):
             raise ToolError("invalid_request", "sticker_selection_expired")
         source = selection["source"]
-        await self.validate_selection(source)
+        item = await self.validate_selection(source)
         context(event, stickers=True)
         raw = event.message_obj.raw_message
         row, won = self.claim(raw, "send", source["stickerId"], source)
@@ -562,6 +668,9 @@ class StickerService:
             return await self.inspect_send(row)
         key = row["idempotency_key"]
         try:
+            if source["kind"] == "pack":
+                await self.prepare_pack(event, source, item)
+            context(event, stickers=True)
             sent = await self.adapter.send_chain(
                 ctx.thread,
                 None,
@@ -574,16 +683,27 @@ class StickerService:
                 self.adapter.state.finish_sticker(key, "failed")
                 return result("send", "failed")
         except BaseException as error:
+            record = self.adapter.state.send_record(key)
             state = (
                 "failed"
-                if isinstance(error, (ValueError, SendError))
-                and (not isinstance(error, SendError) or error.state == "failed")
+                if not record
+                or record["state"] == "failed"
+                or isinstance(error, ValueError)
+                or (isinstance(error, SendError) and error.state == "failed")
                 else "needs_review"
             )
             self.adapter.state.finish_sticker(key, state)
             if isinstance(error, asyncio.CancelledError):
                 raise
-            return result("send", state)
+            if isinstance(error, ToolError):
+                raise
+            fields = {}
+            if state == "failed" and isinstance(error, NativeAPIError):
+                fields = {
+                    "reason": error.code,
+                    "message": "Native 已明确拒绝这次表情发送，未发送成功。",
+                }
+            return result("send", state, **fields)
         return await self.inspect_send(
             self.adapter.state.sticker_operation(ctx.account, ctx.thread, ctx.message_id, "send")
         )
