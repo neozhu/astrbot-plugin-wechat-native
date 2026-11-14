@@ -2,6 +2,7 @@
 
 import asyncio
 
+from .sticker_service import StickerService
 from .tool_support import context, encode, error_result
 
 
@@ -11,6 +12,8 @@ async def run_sticker(event, action, **kwargs):
     try:
         ctx = context(event, stickers=True, sticker_recovery=action == "send")
         adapter = ctx.adapter
+        if type(adapter.stickers) is not StickerService:
+            adapter.stickers = StickerService(adapter)
         adapter._send_tasks.add(task)
         return encode(await getattr(adapter.stickers, action)(event, **kwargs))
     except Exception as error:

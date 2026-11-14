@@ -4,6 +4,31 @@
 初版的历史验证结果保留在下方；本次按用户要求将群聊引用改为自动去重收藏，
 去掉收藏的管理员/明确请求限制，见[增量开发记录](superpowers/plans/2026-11-14-sticker-auto-save.md)。
 本次全量回归 **888 passed**，71个 Sticker 专项场景通过；真实微信读取与自动收藏仍待验收。
+
+## 2026-11-14 实机失败日志后的修复与诊断
+
+用户确认 Native 为 v2.4.0，私聊和群聊都出现目录空、引用收藏失败。
+提供的日志只证明 find 返回空候选，save 的 ToolError 被错误分类成泛化 failed；
+不能据此断言此前收藏结果、手机库存或 Native 的具体故障原因。
+
+- 已复现并修复：完整模块重导入时，新旧 ToolError 类属于不同模块命名空间，业务原因被吞掉。
+  保留原有 importlib.reload 兼容及同名伪造异常拒绝测试。
+- 引用未携带资源、撤回、原图过期、格式不支持、权限不足现在返回安全 reason 和具体提示。
+- 接收和收藏时记录 quote_type、quote_state、embedded_sticker 及开关状态；不记录正文、CDN 或密钥。
+- find 返回 Native Saved/已添加包/候选计数；空目录时只读查询 Native 运行版本。
+  空列表不再被描述为收藏失败。未新增同步或下载 POST，幂等/未知结果规则保持不变。
+- 全量回归 **896 passed**（68.25秒），静态检查与源码编译通过。版本保持 v0.3.15。
+
+TDD 记录位于 `.scratch/stickers/`：reimport-error-red.txt（2 failed）到
+reimport-error-green.txt（11 passed）；sticker-diagnostics-red.txt（5 failed）到
+sticker-diagnostics-green.txt（87 passed）；missing-quote-red.txt（1 failed）到
+runtime-diagnostics-full.txt（896 passed）。
+
+更新代码后完整重启 AstrBot 进程/容器，确保微信适配器重新创建。
+实机复测同一流程：私聊引用表情请求保存，再请求查找表情；收集新增的
+“引用表情诊断”“表情目录诊断”和两个工具 JSON 结果，以继续定位 Native 资源/目录问题。
+原始实机故障尚未确认恢复，不能把上述自动测试当作微信端验收通过。
+
 修改前工作区干净，`main` 为 `2188fc7`；与 `origin/main` (`95b132f`) 的差异只有 SPEC 文档。
 已在修改前阅读六个指定实现文件，并核对 Native v2.4.0 的官方 OpenAPI 和服务端实现。
 

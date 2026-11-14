@@ -7,6 +7,7 @@ from aiohttp import web
 from astrbot.api import logger  # noqa: F401
 from conftest import module
 from test_history_tools import tool_event
+from test_stickers import find, save, save_event, send_event
 
 
 @pytest.mark.parametrize(
@@ -179,5 +180,50 @@ async def test_reinjected_event_keeps_adapter_ownership(serve, tmp_path, monkeyp
         assert accepted["ok"] is True
         rejected = json.loads(await plugin.wechat_get_recent_messages(event))
         assert rejected["status"] == "not_available"
+    finally:
+        await adapter.terminate()
+
+
+async def test_sticker_tool_replaces_retained_service_after_plugin_reload(serve, tmp_path):
+    native, adapter, event = await send_event(serve, tmp_path)
+    current_service = module("sticker_service").StickerService
+
+    async def legacy_find(self, event, query="", limit=12):
+        return {"ok": True, "status": "success", "action": "find", "items": [], "count": 0}
+
+    previous_service = type(
+        "StickerService",
+        (current_service,),
+        {"__module__": current_service.__module__, "find": legacy_find},
+    )
+    adapter.stickers = previous_service(adapter)
+    try:
+        result = await find(event)
+        assert result["catalog"]["saved_count"] == 1
+        assert result["catalog"]["added_pack_count"] == 1
+        assert result["count"] == 2
+        assert not any(c[0] == "POST" for c in native.calls)
+    finally:
+        await adapter.terminate()
+
+
+async def test_replacing_retained_sticker_service_preserves_unknown_intent(serve, tmp_path):
+    native, adapter, event = await save_event(serve, tmp_path)
+    native.post_status = 503
+    assert (await save(event))["status"] == "needs_review"
+    current_service = module("sticker_service").StickerService
+
+    async def legacy_save(self, event):
+        return {"ok": False, "status": "failed", "action": "save"}
+
+    previous_service = type(
+        "StickerService",
+        (current_service,),
+        {"__module__": current_service.__module__, "save": legacy_save},
+    )
+    adapter.stickers = previous_service(adapter)
+    try:
+        assert (await save(event))["status"] == "needs_review"
+        assert len([c for c in native.calls if c[0] == "POST"]) == 1
     finally:
         await adapter.terminate()
