@@ -13,10 +13,13 @@ from astrbot.api.event import MessageChain
 from astrbot.api.message_components import At, Image, Plain, Reply
 from conftest import module
 from test_adapter import message
-from test_native_client import VALID_JPEG, member_lookup
+from test_gif_sticker import oversized_gif
+from test_native_client import VALID_GIF, VALID_JPEG, member_lookup
 
 
-async def image_adapter(serve, tmp_path, *, thread="peer", outcome="accepted", fail_at=1):
+async def image_adapter(
+    serve, tmp_path, *, thread="peer", outcome="accepted", fail_at=1, original=False
+):
     msg = message(threadId=thread)
     requests, uploads, posts = [], [], []
     jobs = {}
@@ -60,7 +63,11 @@ async def image_adapter(serve, tmp_path, *, thread="peer", outcome="accepted", f
             assert key not in [entry[0] for entry in posts]
             posts.append((key, payload))
             if payload.get("kind") == "image":
-                assert set(payload) == {"threadId", "kind", "sourceId"}
+                expected = {"threadId", "kind", "sourceId"}
+                if original:
+                    expected.add("imageQuality")
+                    assert payload["imageQuality"] == "original"
+                assert set(payload) == expected
                 state = outcome if len(uploads) == fail_at else "accepted"
                 if state in {"http400", "http408", "http503", "lost"}:
                     status = {"http400": 400, "http408": 408, "http503": 503, "lost": 503}[state]
@@ -114,7 +121,13 @@ async def image_adapter(serve, tmp_path, *, thread="peer", outcome="accepted", f
 
     url = await serve(handler)
     adapter = module("adapter").WeChatNativeAdapter(
-        {"id": "native-a", "server_url": url, "account_id": "a", "token": "fake"},
+        {
+            "id": "native-a",
+            "server_url": url,
+            "account_id": "a",
+            "token": "fake",
+            "image_quality_original": original,
+        },
         {},
         asyncio.Queue(),
         state_dir=tmp_path,
@@ -165,6 +178,210 @@ async def test_single_image_sources(serve, tmp_path, public_image_url, source):
         assert requests.index(("POST", "/v1/accounts/a/uploads")) < requests.index(
             ("POST", "/v1/accounts/a/sends")
         )
+    finally:
+        await adapter.terminate()
+
+
+async def gif_adapter(
+    serve, tmp_path, *, prepare_state="available", sticker=True, compression="none"
+):
+    """Serve uploads, one sticker preparation job and one sticker send."""
+    msg = message()
+    posts, uploads, preparations = [], [], []
+    native = {"prepare_state": prepare_state}
+
+    async def handler(req):
+        if "/messages/" in req.path:
+            return web.json_response(msg)
+        if "/members/" in req.path:
+            return web.json_response(member_lookup(req.path.rsplit("/", 1)[-1]))
+        if req.path.endswith("/uploads"):
+            form = await req.multipart()
+            file = await form.next()
+            data = bytes(await file.read())
+            uploads.append((file.filename, file.headers["Content-Type"], data))
+            return web.json_response(
+                {
+                    "id": f"source-{len(uploads)}",
+                    "name": file.filename,
+                    "mediaType": file.headers["Content-Type"],
+                    "byteLength": len(data),
+                    "sha256": hashlib.sha256(data).hexdigest(),
+                },
+                status=201,
+            )
+        if req.path.endswith("/sticker-preparations"):
+            body = await req.json()
+            preparations.append((req.headers["Idempotency-Key"], body))
+            return web.json_response(
+                {
+                    "id": "prep1",
+                    "accountId": "a",
+                    "kind": "sticker_prepare",
+                    "state": native["prepare_state"],
+                    "phase": "completed",
+                    "sourceId": body["sourceId"],
+                    "result": {
+                        "id": "prep1",
+                        "sourceId": body["sourceId"],
+                        "original": {
+                            "id": "prep1_original",
+                            "accountId": "a",
+                            "messageId": None,
+                            "kind": "sticker",
+                            "variant": "original",
+                            "actualVariant": "original",
+                            "state": "available",
+                            "contentType": "image/gif",
+                            "byteLength": len(VALID_GIF),
+                            "sha256": hashlib.sha256(VALID_GIF).hexdigest(),
+                        },
+                    },
+                },
+                status=202,
+            )
+        if req.path.endswith("/sends"):
+            body = await req.json()
+            posts.append((req.headers["Idempotency-Key"], body))
+            return web.json_response(
+                {
+                    "id": "job-sticker" if body.get("kind") == "sticker" else "job-image",
+                    "accountId": "a",
+                    "kind": "sticker_send" if body.get("kind") == "sticker" else "send",
+                    "threadId": "peer",
+                    "state": "available" if body.get("kind") == "sticker" else "accepted",
+                    "phase": "completed",
+                    "serverMessageId": "999",
+                    "sourceId": body.get("sourceId"),
+                    "result": {"serverAcceptance": "accepted", "messageIds": ["out-1"],
+                               "profileProjection": "complete"},
+                },
+                status=202,
+            )
+        if "/jobs/" in req.path or req.path.endswith("by-idempotency-key"):
+            return web.json_response(
+                {
+                    "id": "job-sticker",
+                    "accountId": "a",
+                    "kind": "sticker_send",
+                    "threadId": "peer",
+                    "state": "available",
+                    "phase": "completed",
+                    "serverMessageId": "999",
+                    "result": {"serverAcceptance": "accepted", "profileProjection": "complete"},
+                }
+            )
+        return web.json_response({}, status=404)
+
+    url = await serve(handler)
+    adapter = module("adapter").WeChatNativeAdapter(
+        {
+            "id": "native-a",
+            "server_url": url,
+            "account_id": "a",
+            "token": "fake",
+            "send_gif_as_sticker": sticker,
+            "gif_sticker_compression": compression,
+        },
+        {},
+        asyncio.Queue(),
+        state_dir=tmp_path,
+    )
+    await adapter.client.open()
+    adapter.bot_self_id = "bot"
+    adapter.client.poll_interval = 0.001
+    adapter.state.accept("1", "m1", "peer", "900", "queued")
+    converted = module("event").convert_message(msg, adapter.native_config, "bot")
+    event = module("event").WeChatNativeEvent(converted, adapter)
+    return adapter, event, posts, uploads, preparations
+
+
+async def test_gif_is_sent_as_a_prepared_sticker(serve, tmp_path):
+    adapter, event, posts, uploads, preparations = await gif_adapter(serve, tmp_path)
+    try:
+        await event.send(MessageChain([Image.fromBytes(VALID_GIF)]))
+        assert uploads[0][0] == "image.gif"
+        assert preparations[0][1] == {"sourceId": "source-1", "maxEdge": 1024}
+        assert posts[0][1] == {
+            "kind": "sticker",
+            "threadId": "peer",
+            "source": {"kind": "prepared", "preparationId": "prep1"},
+        }
+        assert adapter.state.message_status("m1") == "replied"
+    finally:
+        await adapter.terminate()
+
+
+async def test_gif_falls_back_to_an_image_when_preparation_fails(serve, tmp_path):
+    adapter, event, posts, _, preparations = await gif_adapter(
+        serve, tmp_path, prepare_state="failed"
+    )
+    try:
+        await event.send(MessageChain([Image.fromBytes(VALID_GIF)]))
+        assert preparations
+        assert posts[0][1]["kind"] == "image"
+        assert posts[0][1]["sourceId"] == "source-1"
+    finally:
+        await adapter.terminate()
+
+
+async def test_oversized_gif_is_compressed_before_preparation(serve, tmp_path):
+    source = oversized_gif()
+    assert len(source) > 1024 * 1024
+    adapter, event, posts, uploads, preparations = await gif_adapter(
+        serve, tmp_path, compression="auto"
+    )
+    try:
+        await event.send(MessageChain([Image.fromBytes(source)]))
+        assert uploads[0][0] == "image.gif"
+        assert len(uploads[0][2]) <= 1024 * 1024
+        assert uploads[0][2] != source
+        assert preparations[0][1] == {"sourceId": "source-1", "maxEdge": 1024}
+        assert posts[0][1]["kind"] == "sticker"
+    finally:
+        await adapter.terminate()
+
+
+async def test_gif_compression_can_be_disabled(serve, tmp_path):
+    source = oversized_gif()
+    adapter, event, _, uploads, _ = await gif_adapter(serve, tmp_path, compression="none")
+    try:
+        await event.send(MessageChain([Image.fromBytes(source)]))
+        assert uploads[0][2] == source
+    finally:
+        await adapter.terminate()
+
+
+async def test_gif_sticker_send_can_be_disabled(serve, tmp_path):
+    adapter, event, posts, _, preparations = await gif_adapter(serve, tmp_path, sticker=False)
+    try:
+        await event.send(MessageChain([Image.fromBytes(VALID_GIF)]))
+        assert not preparations
+        assert posts[0][1]["kind"] == "image"
+    finally:
+        await adapter.terminate()
+
+
+async def test_original_image_quality_is_opt_in(serve, tmp_path):
+    adapter, event, _, _, posts, _ = await image_adapter(serve, tmp_path, original=True)
+    try:
+        await event.send(MessageChain([Image.fromBytes(VALID_JPEG)]))
+        assert posts[0][1] == {
+            "threadId": "peer",
+            "kind": "image",
+            "sourceId": "source-1",
+            "imageQuality": "original",
+        }
+        assert adapter.state.message_status("m1") == "replied"
+    finally:
+        await adapter.terminate()
+
+
+async def test_standard_image_quality_omits_the_field(serve, tmp_path):
+    adapter, event, _, _, posts, _ = await image_adapter(serve, tmp_path)
+    try:
+        await event.send(MessageChain([Image.fromBytes(VALID_JPEG)]))
+        assert posts[0][1] == {"threadId": "peer", "kind": "image", "sourceId": "source-1"}
     finally:
         await adapter.terminate()
 

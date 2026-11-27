@@ -48,6 +48,7 @@ from .event import (
     sticker_preview,
 )
 from .friend_requests import FriendRequests
+from .gif_compress import fit_sticker_gif
 from .history_tools import HistoryTools
 from .loop_guard import LoopGuard
 from .native_client import (
@@ -1515,13 +1516,8 @@ class WeChatNativeAdapter(Platform):
                                 record_chunks=record_voice_progress,
                             )
                         else:
-                            receipt = await self.client.send_image(
-                                thread,
-                                data,
-                                content_type,
-                                key,
-                                record_job=lambda job_id: self.state.record_send_id(key, job_id),
-                                before_send=check_current_source,
+                            receipt = await self._send_image_part(
+                                thread, data, content_type, key, check_current_source
                             )
                     except BaseException as error:
                         state = "needs_review"
@@ -1582,6 +1578,53 @@ class WeChatNativeAdapter(Platform):
                     if message_id:
                         self.state.mark_message(message_id, "replied")
                 return True
+
+    async def _send_image_part(self, thread, data, content_type, key, before_send) -> dict:
+        """Send one image part, as a prepared WeChat sticker when that is enabled.
+
+        A GIF sent as an ordinary image is delivered as a still picture, so it is
+        prepared as a sticker first. Preparation restricts the edge length, the
+        output size, the frame count and the timeline, so any rejection, timeout
+        or unsupported source falls back to the ordinary image send instead of
+        failing the message.
+        """
+        payload = data
+        source = None
+        if self.native_config.send_gif_as_sticker and content_type == "image/gif":
+            if self.native_config.gif_sticker_compression != "none":
+                # Native refuses any prepared sticker above 1 MiB, and most GIFs
+                # are far above that. Decoding every frame takes seconds, so it
+                # runs off the event loop; a failed fit keeps the source bytes.
+                payload = (
+                    await asyncio.to_thread(
+                        fit_sticker_gif, data, self.native_config.gif_sticker_compression
+                    )
+                    or data
+                )
+            source = await self.client.stage_image(payload, content_type, key + "-sticker")
+            if source is not None:
+                prepared = await self.client.prepare_sticker(source["id"], key + "-sticker")
+                if prepared is not None:
+                    await before_send()
+                    return await self.client.send_sticker(
+                        thread,
+                        {"kind": "prepared", "preparationId": prepared["id"]},
+                        key,
+                        record_job=lambda job_id: self.state.record_send_id(key, job_id),
+                    )
+        image_quality = "original" if self.native_config.image_quality_original else None
+        return await self.client.send_image(
+            thread,
+            # Send the bytes that were staged, so the payload and the source
+            # identity cannot describe different media.
+            payload if source is not None else data,
+            content_type,
+            key,
+            record_job=lambda job_id: self.state.record_send_id(key, job_id),
+            before_send=before_send,
+            image_quality=image_quality,
+            source=source,
+        )
 
     async def send_by_session(self, session, message_chain):
         thread = session_target(session.session_id, self.native_config.account_id)

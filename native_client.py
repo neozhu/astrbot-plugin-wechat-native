@@ -28,6 +28,7 @@ from .config import (
     MAX_VOICE_BYTES,
     MAX_VOICE_SECONDS,
     MEDIA_DOWNLOAD_TIMEOUT,
+    STICKER_MAX_EDGE,
     VOICE_SEND_TIMEOUT,
 )
 from .state import cursor_number
@@ -2050,6 +2051,8 @@ class NativeClient:
         *,
         record_job: Callable[[str], None],
         before_send: Callable[[], Awaitable[None]],
+        image_quality: str | None = None,
+        source: dict | None = None,
     ) -> dict:
         """Stage bytes, submit one image job, then read that job without resubmitting."""
         suffix = {"image/jpeg": "jpg", "image/png": "png", "image/gif": "gif", "image/webp": "webp"}
@@ -2064,6 +2067,8 @@ class NativeClient:
             filename="image." + suffix[content_type],
             record_job=record_job,
             before_send=before_send,
+            image_quality=image_quality,
+            source=source,
         )
 
     async def send_voice(
@@ -2103,6 +2108,90 @@ class NativeClient:
             record_chunks=record_chunks,
         )
 
+    async def _upload_source(self, data: bytes, content_type: str, filename: str, key: str) -> dict:
+        """Stage bytes once and verify the returned source identity."""
+        form = aiohttp.FormData()
+        form.add_field("file", data, filename=filename, content_type=content_type)
+        source = await self._request("POST", self.prefix + "/uploads", data=form)
+        if (
+            not isinstance(source.get("id"), str)
+            or not source["id"]
+            or source.get("byteLength") != len(data)
+            or source.get("sha256") != hashlib.sha256(data).hexdigest()
+        ):
+            raise SendError("upload_identity_mismatch", key)
+        return source
+
+    async def stage_image(self, data: bytes, content_type: str, key: str) -> dict | None:
+        """Upload one image once, so preparation and fallback share the same source."""
+        suffix = {"image/jpeg": "jpg", "image/png": "png", "image/gif": "gif", "image/webp": "webp"}
+        if content_type not in suffix or validate_image_bytes(data) != content_type:
+            return None
+        return await self._upload_source(data, content_type, "image." + suffix[content_type], key)
+
+    async def prepare_sticker(self, source_id: str, key: str) -> dict | None:
+        """Prepare one already staged image as a sticker, without uploading again.
+
+        Returns the prepared sticker, or None when this source cannot become one
+        so the caller can fall back to an ordinary image send.
+        """
+        try:
+            value = await self._request(
+                "POST",
+                self.prefix + "/sticker-preparations",
+                json={"sourceId": source_id, "maxEdge": STICKER_MAX_EDGE},
+                headers={"Idempotency-Key": key},
+                expected_status=202,
+            )
+            deadline = asyncio.get_running_loop().time() + self.send_timeout
+            while True:
+                if (
+                    not isinstance(value.get("id"), str)
+                    or not value["id"]
+                    or value.get("kind") != "sticker_prepare"
+                    or value.get("accountId") != self.account_id
+                    or value.get("sourceId") != source_id
+                ):
+                    raise SendError("receipt_identity_mismatch", key)
+                state = value.get("state")
+                if state == "available":
+                    prepared = value.get("result")
+                    if (
+                        isinstance(prepared, dict)
+                        and isinstance(prepared.get("id"), str)
+                        and prepared["id"]
+                        and isinstance(prepared.get("original"), dict)
+                        and prepared["original"].get("contentType") == "image/gif"
+                    ):
+                        return prepared
+                    return None
+                if state in {"failed", "cancelled", "expired", "unsupported"}:
+                    logger.warning(
+                        "WeChat Native 表情制备不可用，改用图片发送：state=%s reason=%s",
+                        state,
+                        value.get("reason") if isinstance(value.get("reason"), str) else "none",
+                    )
+                    return None
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0 or state not in {"queued", "running"}:
+                    return None
+                try:
+                    async with asyncio.timeout(remaining):
+                        await asyncio.sleep(min(self.poll_interval, remaining))
+                        value = await self._request(
+                            "GET",
+                            self.prefix + "/sticker-preparations/" + quote(value["id"], safe=""),
+                        )
+                except NativeAPIError as error:
+                    if error.status in {0, 408, 429} or 500 <= error.status < 600:
+                        continue  # Retry this read; the preparation is already submitted.
+                    raise
+                except TimeoutError:
+                    return None
+        except (NativeAPIError, TimeoutError):
+            logger.warning("WeChat Native 表情制备失败，改用图片发送")
+            return None
+
     async def _send_media(
         self,
         thread: str,
@@ -2115,22 +2204,17 @@ class NativeClient:
         record_job: Callable[[str], None],
         before_send: Callable[[], Awaitable[None]],
         record_chunks=None,
+        image_quality: str | None = None,
+        source: dict | None = None,
     ) -> dict:
         """Share upload, idempotent submission and job polling for images and voice."""
-        form = aiohttp.FormData()
-        form.add_field("file", data, filename=filename, content_type=content_type)
-        source = await self._request("POST", self.prefix + "/uploads", data=form)
-        if (
-            not isinstance(source.get("id"), str)
-            or not source["id"]
-            or source.get("byteLength") != len(data)
-            or source.get("sha256") != hashlib.sha256(data).hexdigest()
-        ):
-            raise SendError("upload_identity_mismatch", key)
+        if source is None:
+            source = await self._upload_source(data, content_type, filename, key)
         await before_send()
-        value = await self._submit_send(
-            {"threadId": thread, "kind": kind, "sourceId": source["id"]}, key
-        )
+        payload = {"threadId": thread, "kind": kind, "sourceId": source["id"]}
+        if image_quality == "original":
+            payload["imageQuality"] = "original"
+        value = await self._submit_send(payload, key)
         deadline = asyncio.get_running_loop().time() + (
             self.voice_send_timeout if kind == "voice" else self.send_timeout
         )

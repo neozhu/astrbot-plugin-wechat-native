@@ -8,6 +8,7 @@ PLUGIN_ID = "astrbot_plugin_wechat_native"
 ADAPTER_ID = "wechat_native"
 
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
+STICKER_MAX_EDGE = 1024
 MAX_VOICE_BYTES = 25 * 1024 * 1024 - 17
 MAX_VOICE_SECONDS = 300
 VOICE_SEND_TIMEOUT = 25 * 60
@@ -35,6 +36,9 @@ DEFAULT_CONFIG = {
     "token_file": "/run/secrets/wechat-api-token",
     "enable_private_reply": True,
     "enable_media": True,
+    "image_quality_original": False,
+    "send_gif_as_sticker": True,
+    "gif_sticker_compression": "auto",
     "enable_stickers": False,
     "allowed_users": [],
     "group_reply_mode": "mention",
@@ -137,6 +141,40 @@ CONFIG_METADATA = {
             "开启后也会尝试读取链接卡片的封面。"
         ),
     },
+    # 非 JPEG 源会按全分辨率重新编码成 JPEG，所以动图只剩一帧；JPEG 源原样发送，
+    # 其中的拍摄参数等元数据也随之保留。两点都写在这里，不写进表单说明：
+    # 对开关本身的描述只会误导，副作用不是用户的选择项。
+    "image_quality_original": {
+        "type": "bool",
+        "description": "图片以原图画质发送",
+        "hint": (
+            "关闭时按标准画质发送，微信端会压缩图片。开启后 JPEG 原样发送，"
+            "PNG、GIF、WebP 转为全分辨率 JPEG。"
+        ),
+    },
+    "send_gif_as_sticker": {
+        "type": "bool",
+        "description": "GIF 以微信表情发送",
+        "hint": (
+            "微信按普通图片收下的 GIF 会变成静态图。开启后 GIF 改为表情发送，"
+            "保留动画；超出表情通道限制时按下面的压缩方式处理，"
+            "压缩后仍不满足则回退为普通图片。关闭后 GIF 仍按图片发送。"
+        ),
+    },
+    "gif_sticker_compression": {
+        "type": "string",
+        "description": "GIF 表情压缩方式",
+        "options": ["none", "auto", "conservative"],
+        "labels": ["不压缩", "自动", "保守"],
+        "hint": (
+            "表情通道只接受 1 MiB、200 帧、10 秒、最长边 1024 以内的 GIF。"
+            "自动：按源图的尺寸、帧数和时长直接选定一档，缩小画面、抽帧、减少颜色，"
+            "超过 10 秒的会略微加快；"
+            "保守：不抽帧、不改节奏，只缩小画面和减少颜色，更完整但可能仍然超限；"
+            "不压缩：原样提交，只有本来就满足限制的 GIF 能变成表情。"
+            "压缩过的 GIF 透明背景会合成白底。"
+        ),
+    },
     "allowed_users": {
         "type": "list",
         "description": "私聊用户白名单",
@@ -204,6 +242,9 @@ class NativeConfig:
     token_file: str = field(repr=False)
     enable_private_reply: bool = True
     enable_media: bool = True
+    image_quality_original: bool = False
+    send_gif_as_sticker: bool = True
+    gif_sticker_compression: str = "auto"
     enable_stickers: bool = False
     allowed_users: frozenset[str] = frozenset()
     group_reply_mode: str = "mention"
@@ -246,9 +287,14 @@ class NativeConfig:
         style = data.get("group_reply_style", "mention")
         if not isinstance(style, str) or style not in {"mention", "quote", "plain"}:
             raise ValueError("group_reply_style 必须为 mention/quote/plain")
+        compression = data.get("gif_sticker_compression", "auto")
+        if not isinstance(compression, str) or compression not in {"none", "auto", "conservative"}:
+            raise ValueError("gif_sticker_compression 必须为 none/auto/conservative")
         for key in (
             "enable_private_reply",
             "enable_media",
+            "image_quality_original",
+            "send_gif_as_sticker",
             "enable_stickers",
             "enable_group_red_packet_reply",
             "unique_session",
@@ -281,6 +327,9 @@ class NativeConfig:
             token_file=data.get("token_file", ""),
             enable_private_reply=data.get("enable_private_reply", True),
             enable_media=data.get("enable_media", True),
+            image_quality_original=data.get("image_quality_original", False),
+            send_gif_as_sticker=data.get("send_gif_as_sticker", True),
+            gif_sticker_compression=compression,
             enable_stickers=data.get("enable_stickers", False),
             group_reply_mode=mode,
             group_reply_style=style,

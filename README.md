@@ -108,6 +108,9 @@ Native Token 需要目标账号的 **read + send + media** 权限。本文 Compo
 | --- | --- | --- |
 | `enable_private_reply` | `true` | 是否回复私聊 |
 | `enable_media` | `true` | 启用图片、PDF 与语音接收；群聊支持引用媒体 + @提问，或先发送再 @并使用读取指令 |
+| `image_quality_original` | `false` | 以原图画质发送图片；关闭时按标准画质发送，微信端会压缩。开启后 JPEG 原样发送，PNG、GIF、WebP 转为全分辨率 JPEG |
+| `send_gif_as_sticker` | `true` | GIF 以微信表情发送；开启时走 Native 的贴纸制备通道，失败则回退普通图片 |
+| `gif_sticker_compression` | `auto` | 超出表情通道限制的 GIF 如何压缩：`auto` 按源图参数直接选档，缩小画面、抽帧与减色；`conservative` 只缩小和减色、不抽帧；`none` 不压缩 |
 | `enable_stickers` | `false` | 开启原生表情读取、查找与发送及管理员私聊 `/表情包同步` 指令；视觉读取还需 `enable_media` |
 | `allowed_users` | `[]` | 私聊 senderId 白名单；空列表允许所有人，不限制群成员 |
 | `group_reply_mode` | `mention` | `mention`：真正 @机器人；`all`：全部群文本与直接语音都直接唤醒；`probability`：全部进入 AstrBot，但只有 @ 唤醒，其余交给 AstrBot 的主动回复概率；`disabled`：不回复群聊 |

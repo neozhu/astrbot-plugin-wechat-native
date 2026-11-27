@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.3.25 — 2026-11-22
+
+- Choose the GIF sticker gear from the source's own shape instead of trial-encoding every ladder step: a measured bytes-per-pixel budget per palette size predicts the output and the first gear that fits is encoded once, with a single cheapest fallback. Auto now uses five gears, conservative seven.
+- Drop frames in auto mode when even the smallest gear is predicted to exceed 1 MiB, and give the two smallest palettes their own budget: without them conservative mode refused every GIF that needed them.
+- Fix a timeline bug that let compressed GIFs stay above the 10 s sticker limit when delays were uneven. Kept frames now absorb the delays of the frames they replace, and the whole timeline is scaled into 10 s, so a long animation plays slightly faster instead of losing its ending.
+- Bound peak memory while compressing: frames are scaled before they are held, and the total pixel budget is capped, so a large GIF can no longer exhaust the container.
+- Retry transient preparation reads instead of discarding a preparation that was already submitted.
+- Send the staged bytes when a compressed GIF falls back to an ordinary image, so the payload and the source identity describe the same media.
+- Mention in the form hint that compression composites transparency onto white.
+
+## 0.3.24 — 2026-11-22
+
+- Fit oversized GIFs into the sticker limits before preparing them, so chat GIFs above 1 MiB still become animated stickers instead of falling back to a static image. A GIF that already fits is uploaded unchanged and Native keeps its exact bytes.
+- Add the `gif_sticker_compression` setting: `auto` shrinks, samples frames and reduces colours; `conservative` only shrinks and reduces colours; `none` leaves the bytes alone. Compression runs off the event loop with a 30 s budget and never fails the send.
+- Drop the still-picture and metadata side effects from the `image_quality_original` form hint; they are documented as code comments instead.
+
+## 0.3.23 — 2026-11-22
+
+- Send GIF images through the Native sticker channel so WeChat renders them as animated stickers instead of compressing them into a static picture. Preparation requests `maxEdge: 1024` and sends `source: {kind: "prepared"}`.
+- Upload each GIF once and reuse that source for the fallback, so a refused preparation still sends an ordinary image without a second upload.
+- Fall back to an ordinary image send whenever preparation is refused, unsupported, times out or the setting is off. Add the `send_gif_as_sticker` setting, on by default.
+
+## 0.3.22 — 2026-11-22
+
+- Add the opt-in `image_quality_original` setting for the robot form. When enabled, image sends carry `imageQuality: "original"` so Native keeps JPEG sources unchanged instead of sending the compressed standard copy.
+- Leave the field out when the setting is off, so existing standard-quality submissions keep their request hash and idempotency behavior.
+
 ## 0.3.21 — 2026-11-21
 
 - Update the recommended Native version to v2.9.0. New bindings start after the latest event, and existing bindings resume from their saved cursors.
